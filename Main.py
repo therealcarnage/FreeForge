@@ -23,16 +23,14 @@ class ParametricGenerator:
         self.root.resizable(True, True)
         
         # Variables for UI
-        self.template_path = tk.StringVar()
-        self.output_path = tk.StringVar()
+        self.template_path = tk.StringVar(value=r"D:\Documents D\FreeCad\Projects\Rectangle.FCStd")
+        self.output_path = tk.StringVar(value=r"D:\Documents D\FreeForge Output")
         self.freecad_path = tk.StringVar()
-        self.c1_var = tk.StringVar()
-        self.c2_var = tk.StringVar()
-        self.c3_var = tk.StringVar()
-        self.c4_var = tk.StringVar()
-        self.step_var = tk.BooleanVar(value=True)
+        self.c1_var = tk.StringVar(value="100")
+        self.c2_var = tk.StringVar(value="50")
+        self.c3_var = tk.StringVar(value="2")
+        self.c4_var = tk.StringVar(value="1")
         self.stl_var = tk.BooleanVar(value=True)
-        self.dxf_var = tk.BooleanVar(value=False)
         
         # Auto-detect FreeCAD
         self.auto_detect_freecad()
@@ -144,9 +142,7 @@ class ParametricGenerator:
         export_frame = ttk.LabelFrame(main_frame, text="Export Formats", padding="5")
         export_frame.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
         
-        ttk.Checkbutton(export_frame, text="STEP", variable=self.step_var).grid(row=0, column=0, sticky=tk.W)
-        ttk.Checkbutton(export_frame, text="STL", variable=self.stl_var).grid(row=0, column=1, sticky=tk.W) 
-        ttk.Checkbutton(export_frame, text="DXF (optional)", variable=self.dxf_var).grid(row=0, column=2, sticky=tk.W)
+        ttk.Checkbutton(export_frame, text="STL", variable=self.stl_var).grid(row=0, column=0, sticky=tk.W) 
         row += 1
         
         # Generate button
@@ -224,8 +220,8 @@ class ParametricGenerator:
             if not param.strip():
                 errors.append(f"Parameter {name} is required")
                 
-        if not any([self.step_var.get(), self.stl_var.get(), self.dxf_var.get()]):
-            errors.append("Please select at least one export format")
+        if not any([self.stl_var.get()]):
+            errors.append("Please select STL export format")
             
         return errors
         
@@ -299,9 +295,7 @@ class ParametricGenerator:
             env['FREECAD_C2'] = self.c2_var.get()
             env['FREECAD_C3'] = self.c3_var.get()
             env['FREECAD_C4'] = self.c4_var.get()
-            env['FREECAD_STEP'] = str(int(self.step_var.get()))
             env['FREECAD_STL'] = str(int(self.stl_var.get()))
-            env['FREECAD_DXF'] = str(int(self.dxf_var.get()))
             
             # Execute FreeCAD
             try:
@@ -346,171 +340,57 @@ class ParametricGenerator:
         return '''import sys
 import os
 
-def main():
-    try:
-        # Get parameters from environment variables
-        template_file = os.environ['FREECAD_TEMPLATE']
-        output_folder = os.environ['FREECAD_OUTPUT']
-        filename_base = os.environ['FREECAD_BASE']
-        c1_value = os.environ['FREECAD_C1']
-        c2_value = os.environ['FREECAD_C2']
-        c3_value = os.environ['FREECAD_C3']
-        c4_value = os.environ['FREECAD_C4']
-        export_step = bool(int(os.environ['FREECAD_STEP']))
-        export_stl = bool(int(os.environ['FREECAD_STL']))
-        export_dxf = bool(int(os.environ['FREECAD_DXF']))
-        
-        import FreeCAD
-        import Import
-        print(f"FreeCAD {FreeCAD.Version()} loaded successfully")
-        
-        # Open the template document
-        print(f"Opening template: {os.path.basename(template_file)}")
-        doc = FreeCAD.openDocument(template_file)
-        print(f"Document opened: {doc.Name}")
-        
-        # Debug: List all objects in the document
-        print("Objects in document:")
-        for obj in doc.Objects:
-            print(f"  - {obj.Name}: {getattr(obj, 'TypeId', 'Unknown')}")
-        
-        # Find the spreadsheet
-        spreadsheet = None
-        for obj in doc.Objects:
-            if hasattr(obj, 'TypeId') and obj.TypeId == 'Spreadsheet::Sheet':
-                spreadsheet = obj
-                break
-                
-        if spreadsheet:
-            print(f"Found spreadsheet: {spreadsheet.Name}")
-            
-            # Set parameter values using aliases
+try:
+    template_file = os.environ['FREECAD_TEMPLATE']
+    output_folder = os.environ['FREECAD_OUTPUT']
+    filename_base = os.environ['FREECAD_BASE']
+    c1_value = os.environ['FREECAD_C1']
+    c2_value = os.environ['FREECAD_C2']
+    c3_value = os.environ['FREECAD_C3']
+    c4_value = os.environ['FREECAD_C4']
+    
+    print(f"Output folder: {output_folder}")
+    print(f"Folder exists: {os.path.exists(output_folder)}")
+    
+    import FreeCAD
+    
+    # Open document
+    doc = FreeCAD.openDocument(template_file)
+    
+    # Find spreadsheet and set values
+    for obj in doc.Objects:
+        if hasattr(obj, 'TypeId') and obj.TypeId == 'Spreadsheet::Sheet':
             try:
-                spreadsheet.set('C1', c1_value)
-                spreadsheet.set('C2', c2_value) 
-                spreadsheet.set('C3', c3_value)
-                spreadsheet.set('C4', c4_value)
-                print(f"Set parameters: C1={c1_value}, C2={c2_value}, C3={c3_value}, C4={c4_value}")
-            except Exception as e:
-                print(f"WARNING setting spreadsheet values: {e}")
-        else:
-            print("WARNING: No Spreadsheet found in template - proceeding without parameter update")
-            
-        # Recompute the document
-        print("Recomputing document...")
-        doc.recompute()
-        print("Document recomputed")
-        
-        # Find objects to export - try multiple strategies
-        export_obj = None
-        
-        # Strategy 1: Find object named "Body"
-        for obj in doc.Objects:
-            if obj.Name == "Body":
-                export_obj = obj
-                print(f"Found Body by name: {obj.Name} ({getattr(obj, 'TypeId', 'Unknown')})")
-                break
-                
-        # Strategy 2: Find first PartDesign::Body
-        if not export_obj:
-            for obj in doc.Objects:
-                if hasattr(obj, 'TypeId') and obj.TypeId == 'PartDesign::Body':
-                    export_obj = obj
-                    print(f"Found PartDesign Body: {obj.Name} ({obj.TypeId})")
-                    break
-                    
-        # Strategy 3: Find any Part::Feature or App::Part
-        if not export_obj:
-            for obj in doc.Objects:
-                if hasattr(obj, 'TypeId') and obj.TypeId in ['Part::Feature', 'App::Part']:
-                    export_obj = obj
-                    print(f"Found Part object: {obj.Name} ({obj.TypeId})")
-                    break
-        
-        # Strategy 4: Find any object with a Shape
-        if not export_obj:
-            for obj in doc.Objects:
-                if hasattr(obj, 'Shape') and hasattr(obj.Shape, 'isValid') and obj.Shape.isValid():
-                    export_obj = obj
-                    print(f"Found object with valid shape: {obj.Name} ({getattr(obj, 'TypeId', 'Unknown')})")
-                    break
-                    
-        if not export_obj:
-            print("ERROR: No exportable object found")
-            print("Available objects:")
-            for obj in doc.Objects:
-                has_shape = hasattr(obj, 'Shape')
-                print(f"  - {obj.Name} ({getattr(obj, 'TypeId', 'Unknown')}) - Shape: {has_shape}")
-            return 1
-            
-        print(f"Using export object: {export_obj.Name} ({getattr(export_obj, 'TypeId', 'Unknown')})")
-        
-        # Export files
-        export_count = 0
-        
-        if export_step:
-            try:
-                step_file = os.path.join(output_folder, f"{filename_base}.step")
-                print(f"Exporting STEP to: {step_file}")
-                Import.export([export_obj], step_file)
-                if os.path.exists(step_file):
-                    print(f"✓ Exported STEP: {os.path.basename(step_file)} ({os.path.getsize(step_file)} bytes)")
-                    export_count += 1
-                else:
-                    print("ERROR: STEP file was not created")
-            except Exception as e:
-                print(f"ERROR exporting STEP: {e}")
-                import traceback
-                traceback.print_exc()
-                
-        if export_stl:
-            try:
-                stl_file = os.path.join(output_folder, f"{filename_base}.stl")
-                print(f"Exporting STL to: {stl_file}")
-                import Mesh
-                Mesh.export([export_obj], stl_file)
-                if os.path.exists(stl_file):
-                    print(f"✓ Exported STL: {os.path.basename(stl_file)} ({os.path.getsize(stl_file)} bytes)")
-                    export_count += 1
-                else:
-                    print("ERROR: STL file was not created")
-            except Exception as e:
-                print(f"ERROR exporting STL: {e}")
-                import traceback
-                traceback.print_exc()
-                
-        if export_dxf:
-            try:
-                dxf_file = os.path.join(output_folder, f"{filename_base}.dxf")
-                print(f"Exporting DXF to: {dxf_file}")
-                Import.export([export_obj], dxf_file)
-                if os.path.exists(dxf_file):
-                    print(f"✓ Exported DXF: {os.path.basename(dxf_file)} ({os.path.getsize(dxf_file)} bytes)")
-                    export_count += 1
-                else:
-                    print("WARNING: DXF file was not created")
-            except Exception as e:
-                print(f"WARNING: DXF export failed (this is optional): {e}")
-                
-        # Close document
-        FreeCAD.closeDocument(doc.Name)
-        print("Document closed")
-        
-        if export_count > 0:
-            print(f"✓ Successfully exported {export_count} files")
-            return 0
-        else:
-            print("ERROR: No files were exported")
-            return 1
-            
-    except Exception as e:
-        print(f"ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
-
-if __name__ == '__main__':
-    main()
+                obj.set('C2', c1_value)
+                obj.set('C3', c2_value) 
+                obj.set('C4', c3_value)
+                obj.set('C5', c4_value)
+            except:
+                pass
+            break
+    
+    # Recompute
+    doc.recompute()
+    
+    # Find body and export STL
+    for obj in doc.Objects:
+        if obj.Name == "Body":
+            import Mesh
+            stl_file = os.path.join(output_folder, f"{filename_base}.stl")
+            print(f"Full STL path: {os.path.abspath(stl_file)}")
+            Mesh.export([obj], stl_file)
+            if os.path.exists(stl_file):
+                print(f"SUCCESS: File created at {stl_file}")
+                print(f"File size: {os.path.getsize(stl_file)} bytes")
+            else:
+                print(f"ERROR: File not found at {stl_file}")
+            break
+    
+    # Close
+    FreeCAD.closeDocument(doc.Name)
+    
+except Exception as e:
+    print(f"Error: {e}")
 '''
 
 def main():
