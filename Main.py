@@ -139,10 +139,10 @@ class ParametricGenerator:
         row += 1
         
         # Export formats
-        export_frame = ttk.LabelFrame(main_frame, text="Export Formats", padding="5")
+        export_frame = ttk.LabelFrame(main_frame, text="Export Format", padding="5")
         export_frame.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
         
-        ttk.Checkbutton(export_frame, text="STL", variable=self.stl_var).grid(row=0, column=0, sticky=tk.W) 
+        ttk.Checkbutton(export_frame, text="STL", variable=self.stl_var, state='disabled').grid(row=0, column=0, sticky=tk.W) 
         row += 1
         
         # Generate button
@@ -220,8 +220,8 @@ class ParametricGenerator:
             if not param.strip():
                 errors.append(f"Parameter {name} is required")
                 
-        if not any([self.stl_var.get()]):
-            errors.append("Please select STL export format")
+        if not self.stl_var.get():
+            errors.append("STL export must be enabled")
             
         return errors
         
@@ -240,14 +240,14 @@ class ParametricGenerator:
         # Disable button and clear status
         self.root.after(0, lambda: self.generate_btn.configure(state='disabled'))
         self.root.after(0, lambda: self.status_text.delete('1.0', tk.END))
-        self.root.after(0, lambda: self.log("Starting generation..."))
+        self.root.after(0, lambda: self.log("Starting generation"))
         
         try:
             # Validate inputs
             errors = self.validate_inputs()
             if errors:
                 for error in errors:
-                    self.root.after(0, lambda e=error: self.log(f"ERROR: {e}"))
+                    self.root.after(0, lambda e=error: self.log(f"✗ {e}"))
                 return
                 
             # Create the runner script
@@ -257,7 +257,7 @@ class ParametricGenerator:
             with open(runner_path, 'w', encoding='utf-8') as f:
                 f.write(runner_script)
                 
-            self.root.after(0, lambda: self.log("Created runner script"))
+            self.root.after(0, lambda: self.log("Created runner script - Completed"))
             
             # Prepare parameters
             template_file = self.template_path.get()
@@ -283,10 +283,7 @@ class ParametricGenerator:
                 script_content
             ]
             
-            self.root.after(0, lambda: self.log(f"Executing FreeCAD with template: {os.path.basename(template_file)}"))
-            self.root.after(0, lambda: self.log("Generating..."))
-            
-            # Set environment variables to pass arguments to the script
+            # Set environment variables for the script
             env = os.environ.copy()
             env['FREECAD_TEMPLATE'] = template_file
             env['FREECAD_OUTPUT'] = output_folder
@@ -295,9 +292,10 @@ class ParametricGenerator:
             env['FREECAD_C2'] = self.c2_var.get()
             env['FREECAD_C3'] = self.c3_var.get()
             env['FREECAD_C4'] = self.c4_var.get()
-            env['FREECAD_STL'] = str(int(self.stl_var.get()))
             
-            # Execute FreeCAD
+            self.root.after(0, lambda: self.log(f"Executing FreeCAD with template: {os.path.basename(template_file)}"))
+            
+            # Execute FreeCAD with the script
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, 
                                       cwd=os.path.dirname(template_file), timeout=120, env=env)
@@ -305,20 +303,34 @@ class ParametricGenerator:
                 self.root.after(0, lambda: self.log("✗ FreeCAD execution timed out (120 seconds)"))
                 return
             
-            if result.returncode == 0:
-                self.root.after(0, lambda: self.log("FreeCAD execution completed"))
-                if result.stdout.strip():
-                    for line in result.stdout.strip().split('\n'):
-                        self.root.after(0, lambda l=line: self.log(l))
-                self.root.after(0, lambda: self.log("✓ Generation completed successfully!"))
+            # Parse output for progress steps
+            output = result.stdout + result.stderr
+            
+            # Check each step
+            if "Importing project files" in output:
+                self.root.after(0, lambda: self.log("Importing project files - Completed"))
             else:
-                self.root.after(0, lambda: self.log("✗ FreeCAD execution failed"))
-                if result.stderr.strip():
-                    for line in result.stderr.strip().split('\n'):
-                        self.root.after(0, lambda l=line: self.log(f"ERROR: {l}"))
-                if result.stdout.strip():
-                    for line in result.stdout.strip().split('\n'):
-                        self.root.after(0, lambda l=line: self.log(f"OUTPUT: {l}"))
+                self.root.after(0, lambda: self.log("Importing project files - Failed"))
+                
+            if "Postprocessing" in output:
+                self.root.after(0, lambda: self.log("Postprocessing - Completed"))
+            else:
+                self.root.after(0, lambda: self.log("Postprocessing - Failed"))
+                
+            if "Recompute" in output:
+                self.root.after(0, lambda: self.log("Recompute - Completed"))
+            else:
+                self.root.after(0, lambda: self.log("Recompute - Failed"))
+                
+            if "saving" in output:
+                self.root.after(0, lambda: self.log("Saving - Completed"))
+            else:
+                self.root.after(0, lambda: self.log("Saving - Failed"))
+
+            if result.returncode == 0 and not ("Error:" in output):
+                self.root.after(0, lambda: self.log("Generation completed"))
+            else:
+                self.root.after(0, lambda: self.log("Generation failed"))
                         
         except Exception as e:
             self.root.after(0, lambda: self.log(f"✗ Unexpected error: {str(e)}"))
@@ -349,44 +361,35 @@ try:
     c3_value = os.environ['FREECAD_C3']
     c4_value = os.environ['FREECAD_C4']
     
-    print(f"Output folder: {output_folder}")
-    print(f"Folder exists: {os.path.exists(output_folder)}")
-    
     import FreeCAD
     
     # Open document
     doc = FreeCAD.openDocument(template_file)
     
-    # Find spreadsheet and set values
+    # Find spreadsheet and set parameter values
     for obj in doc.Objects:
         if hasattr(obj, 'TypeId') and obj.TypeId == 'Spreadsheet::Sheet':
             try:
-                obj.set('C2', c1_value)
-                obj.set('C3', c2_value) 
-                obj.set('C4', c3_value)
-                obj.set('C5', c4_value)
+                obj.set('C2', c1_value)  # Length
+                obj.set('C3', c2_value)  # Width
+                obj.set('C4', c3_value)  # Height
+                obj.set('C5', c4_value)  # ScaleFactor
             except:
                 pass
             break
     
-    # Recompute
+    # Recompute document
     doc.recompute()
     
-    # Find body and export STL
+    # Find Body object and export STL
     for obj in doc.Objects:
         if obj.Name == "Body":
             import Mesh
             stl_file = os.path.join(output_folder, f"{filename_base}.stl")
-            print(f"Full STL path: {os.path.abspath(stl_file)}")
             Mesh.export([obj], stl_file)
-            if os.path.exists(stl_file):
-                print(f"SUCCESS: File created at {stl_file}")
-                print(f"File size: {os.path.getsize(stl_file)} bytes")
-            else:
-                print(f"ERROR: File not found at {stl_file}")
             break
     
-    # Close
+    # Close document
     FreeCAD.closeDocument(doc.Name)
     
 except Exception as e:
