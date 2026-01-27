@@ -23,13 +23,13 @@ class ParametricGenerator:
         self.root.resizable(True, True)
         
         # Variables for UI
-        self.template_path = tk.StringVar(value=r"D:\Documents D\FreeCad\Projects\Rectangle.FCStd")
-        self.output_path = tk.StringVar(value=r"D:\Documents D\FreeForge Output")
+        self.template_path = tk.StringVar()
+        self.output_path = tk.StringVar()
         self.freecad_path = tk.StringVar()
-        self.c1_var = tk.StringVar(value="100")
-        self.c2_var = tk.StringVar(value="50")
-        self.c3_var = tk.StringVar(value="2")
-        self.c4_var = tk.StringVar(value="1")
+        self.c1_var = tk.StringVar()
+        self.c2_var = tk.StringVar()
+        self.c3_var = tk.StringVar()
+        self.c4_var = tk.StringVar()
         self.stl_var = tk.BooleanVar(value=True)
         
         # Auto-detect FreeCAD
@@ -147,7 +147,7 @@ class ParametricGenerator:
         
         # Generate button
         self.generate_btn = ttk.Button(main_frame, text="Generate", 
-                                     command=self.generate_threaded, style='Generate.TButton')
+                                     command=self.generate, style='Generate.TButton')
         self.generate_btn.grid(row=row, column=0, columnspan=3, pady=20, sticky=(tk.W, tk.E))
         
         # Configure large button style
@@ -197,43 +197,24 @@ class ParametricGenerator:
         self.root.update_idletasks()
         
     def validate_inputs(self):
-        """Validate all required inputs"""
+        """Basic validation"""
         errors = []
         
-        if not self.template_path.get():
-            errors.append("Please select a FreeCAD template file")
-        elif not os.path.isfile(self.template_path.get()):
-            errors.append("Template file does not exist")
+        if not self.template_path.get() or not os.path.isfile(self.template_path.get()):
+            errors.append("Please select a valid template file")
             
-        if not self.output_path.get():
-            errors.append("Please select an output folder")
-        elif not os.path.isdir(self.output_path.get()):
-            errors.append("Output folder does not exist")
+        if not self.output_path.get() or not os.path.isdir(self.output_path.get()):
+            errors.append("Please select a valid output folder")
             
-        if not self.freecad_path.get():
+        if not self.freecad_path.get() or not os.path.isfile(self.freecad_path.get()):
             errors.append("Please select FreeCADCmd.exe")
-        elif not os.path.isfile(self.freecad_path.get()):
-            errors.append("FreeCADCmd.exe does not exist")
             
-        for param, name in [(self.c1_var.get(), "C1"), (self.c2_var.get(), "C2"),
-                           (self.c3_var.get(), "C3"), (self.c4_var.get(), "C4")]:
-            if not param.strip():
-                errors.append(f"Parameter {name} is required")
-                
-        if not self.stl_var.get():
-            errors.append("STL export must be enabled")
+        if not all([self.c1_var.get(), self.c2_var.get(), self.c3_var.get(), self.c4_var.get()]):
+            errors.append("Please enter all parameters")
             
         return errors
         
-    def sanitize_filename_part(self, text):
-        """Sanitize text for use in filenames"""
-        # Keep only alphanumeric, underscore, hyphen, dot, and remove spaces
-        sanitized = re.sub(r'[^a-zA-Z0-9._-]', '', text.replace(' ', ''))
-        return sanitized[:50]  # Limit length
-        
-    def generate_threaded(self):
-        """Run generation in a separate thread to avoid UI freezing"""
-        threading.Thread(target=self.generate, daemon=True).start()
+
         
     def generate(self):
         """Main generation process"""
@@ -263,14 +244,9 @@ class ParametricGenerator:
             template_file = self.template_path.get()
             output_folder = self.output_path.get()
             
-            # Generate output filename base
+            # Generate simple output filename
             template_base = os.path.splitext(os.path.basename(template_file))[0]
-            c1_clean = self.sanitize_filename_part(self.c1_var.get())
-            c2_clean = self.sanitize_filename_part(self.c2_var.get())
-            c3_clean = self.sanitize_filename_part(self.c3_var.get()) 
-            c4_clean = self.sanitize_filename_part(self.c4_var.get())
-            
-            filename_base = f"{template_base}_C1{c1_clean}_C2{c2_clean}_C3{c3_clean}_C4{c4_clean}"
+            filename_base = f"{template_base}_generated"
             
             # Build command - Use -c flag to execute Python code directly
             # Write script to file first, then read and execute it to avoid quote issues
@@ -293,44 +269,21 @@ class ParametricGenerator:
             env['FREECAD_C3'] = self.c3_var.get()
             env['FREECAD_C4'] = self.c4_var.get()
             
-            self.root.after(0, lambda: self.log(f"Executing FreeCAD with template: {os.path.basename(template_file)}"))
+            self.log("Running...")
             
             # Execute FreeCAD with the script
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, 
                                       cwd=os.path.dirname(template_file), timeout=120, env=env)
             except subprocess.TimeoutExpired:
-                self.root.after(0, lambda: self.log("✗ FreeCAD execution timed out (120 seconds)"))
+                self.log("✗ Timed out")
                 return
             
-            # Parse output for progress steps
-            output = result.stdout + result.stderr
-            
-            # Check each step
-            if "Importing project files" in output:
-                self.root.after(0, lambda: self.log("Importing project files - Completed"))
+            # Simple status check
+            if result.returncode == 0:
+                self.log("Done")
             else:
-                self.root.after(0, lambda: self.log("Importing project files - Failed"))
-                
-            if "Postprocessing" in output:
-                self.root.after(0, lambda: self.log("Postprocessing - Completed"))
-            else:
-                self.root.after(0, lambda: self.log("Postprocessing - Failed"))
-                
-            if "Recompute" in output:
-                self.root.after(0, lambda: self.log("Recompute - Completed"))
-            else:
-                self.root.after(0, lambda: self.log("Recompute - Failed"))
-                
-            if "saving" in output:
-                self.root.after(0, lambda: self.log("Saving - Completed"))
-            else:
-                self.root.after(0, lambda: self.log("Saving - Failed"))
-
-            if result.returncode == 0 and not ("Error:" in output):
-                self.root.after(0, lambda: self.log("Generation completed"))
-            else:
-                self.root.after(0, lambda: self.log("Generation failed"))
+                self.log("Failed")
                         
         except Exception as e:
             self.root.after(0, lambda: self.log(f"✗ Unexpected error: {str(e)}"))
