@@ -11,6 +11,7 @@ A minimal Windows desktop app that updates FreeCAD spreadsheet inputs and export
 import json
 import math
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -30,6 +31,13 @@ FREECAD_TIMEOUT = 120
 PARAM_SCAN_TIMEOUT = 60
 PREVIEW_TIMEOUT = 60
 PREVIEW_STL_NAME = "_preview.stl"
+PREVIEW_MARGIN = 18
+
+AXIS_COLORS = {
+    "x": "#ff4d4d",  # red
+    "y": "#39d98a",  # green
+    "z": "#4da3ff",  # blue
+}
 
 FREECAD_FILETYPES = [("FreeCAD files", "*.FCStd"), ("All files", "*.*")]
 EXECUTABLE_FILETYPES = [("Executable files", "*.exe"), ("All files", "*.*")]
@@ -246,12 +254,18 @@ class ParametricGenerator:
             row_number = int(item.get("row", 0))
             label = str(item.get("label", "")).strip() or f"Parameter {row_number}"
             value = str(item.get("value", ""))
+            color = self._parameter_color(label, i)
 
             var = tk.StringVar(value=value)
             var.trace_add("write", lambda *_: self._schedule_preview())
-            ttk.Label(self.params_frame, text=f"{label} (Row {row_number}):").grid(
-                row=i, column=0, sticky=tk.W, padx=5, pady=2
-            )
+            row_wrap = ttk.Frame(self.params_frame)
+            row_wrap.grid(row=i, column=0, sticky=tk.W, padx=5, pady=2)
+
+            swatch = tk.Canvas(row_wrap, width=10, height=10, highlightthickness=0)
+            swatch.pack(side=tk.LEFT, padx=(0, 6))
+            swatch.create_rectangle(0, 0, 10, 10, fill=color, outline=color)
+
+            ttk.Label(row_wrap, text=f"{label} (Row {row_number}):").pack(side=tk.LEFT)
             ttk.Entry(self.params_frame, textvariable=var).grid(
                 row=i, column=1, sticky=(tk.W, tk.E), padx=5, pady=2
             )
@@ -463,32 +477,66 @@ class ParametricGenerator:
         cy = (min(ys) + max(ys)) * 0.5
         cz = (min(zs) + max(zs)) * 0.5
 
-        span = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs), 1e-6)
-        scale = min(width, height) * 0.72 / span
-
         cos_y = math.cos(self.preview_yaw)
         sin_y = math.sin(self.preview_yaw)
         cos_x = math.cos(self.preview_pitch)
         sin_x = math.sin(self.preview_pitch)
 
-        faces = []
+        def rotate_point(px, py, pz):
+            xz_x = px * cos_y + pz * sin_y
+            xz_z = -px * sin_y + pz * cos_y
+            yz_y = py * cos_x - xz_z * sin_x
+            yz_z = py * sin_x + xz_z * cos_x
+            return xz_x, yz_y, yz_z
+
+        # First pass: rotate everything and compute projected extents.
+        centered_faces = []
+        rotated_faces = []
+        proj_xs = []
+        proj_ys = []
+
         for tri in self.preview_triangles:
-            projected = []
-            depth_accum = 0.0
+            ctri = []
+            rtri = []
             for vx, vy, vz in tri:
                 x = vx - cx
                 y = vy - cy
                 z = vz - cz
+                ctri.append((x, y, z))
+                rx, ry, rz = rotate_point(x, y, z)
+                rtri.append((rx, ry, rz))
+                proj_xs.append(rx)
+                proj_ys.append(ry)
+            centered_faces.append(ctri)
+            rotated_faces.append(rtri)
 
-                xz_x = x * cos_y + z * sin_y
-                xz_z = -x * sin_y + z * cos_y
-                yz_y = y * cos_x - xz_z * sin_x
-                yz_z = y * sin_x + xz_z * cos_x
+        min_px = min(proj_xs)
+        max_px = max(proj_xs)
+        min_py = min(proj_ys)
+        max_py = max(proj_ys)
 
-                sx = width * 0.5 + xz_x * scale
-                sy = height * 0.5 - yz_y * scale
-                projected.append((sx, sy, yz_z))
-                depth_accum += yz_z
+        model_w = max(max_px - min_px, 1e-6)
+        model_h = max(max_py - min_py, 1e-6)
+        avail_w = max(width - 2 * PREVIEW_MARGIN, 10)
+        avail_h = max(height - 2 * PREVIEW_MARGIN, 10)
+        scale = min(avail_w / model_w, avail_h / model_h)
+
+        center_px = (min_px + max_px) * 0.5
+        center_py = (min_py + max_py) * 0.5
+
+        def project_to_canvas(rx, ry):
+            sx = width * 0.5 + (rx - center_px) * scale
+            sy = height * 0.5 - (ry - center_py) * scale
+            return sx, sy
+
+        faces = []
+        for tri in rotated_faces:
+            projected = []
+            depth_accum = 0.0
+            for rx, ry, rz in tri:
+                sx, sy = project_to_canvas(rx, ry)
+                projected.append((sx, sy, rz))
+                depth_accum += rz
 
             z_avg = depth_accum / 3.0
             faces.append((z_avg, projected))
@@ -500,6 +548,84 @@ class ParametricGenerator:
             shade = int(max(45, min(220, 140 + z_avg * 22)))
             color = f"#{shade:02x}{shade:02x}{shade:02x}"
             self.preview_canvas.create_polygon(flat, fill=color, outline="#2a2a2a", width=1)
+
+        # Highlight existing mesh edges mapped by axis, not just by length.
+        edge_map = {}
+        for ctri, rtri in zip(centered_faces, rotated_faces):
+            for a, b in ((0, 1), (1, 2), (2, 0)):
+                pa = ctri[a]
+                pb = ctri[b]
+                ra = rtri[a]
+                rb = rtri[b]
+
+                ka = (round(pa[0], 6), round(pa[1], 6), round(pa[2], 6))
+                kb = (round(pb[0], 6), round(pb[1], 6), round(pb[2], 6))
+                key = tuple(sorted((ka, kb)))
+                if key in edge_map:
+                    continue
+
+                dx = pa[0] - pb[0]
+                dy = pa[1] - pb[1]
+                dz = pa[2] - pb[2]
+                edge_len = math.sqrt(dx * dx + dy * dy + dz * dz)
+                edge_map[key] = {
+                    "len": edge_len,
+                    "vec": (dx, dy, dz),
+                    "ra": ra,
+                    "rb": rb,
+                }
+
+        targets = self._parameter_edge_targets()
+        if targets and edge_map:
+            edges = list(edge_map.values())
+            used = set()
+            axis_idx = {"x": 0, "y": 1, "z": 2}
+
+            for target in targets:
+                best_i = None
+                best_score = None
+
+                desired_axis = target.get("axis")
+                desired_idx = axis_idx.get(desired_axis, None)
+
+                for i, e in enumerate(edges):
+                    if i in used:
+                        continue
+
+                    s1 = project_to_canvas(e["ra"][0], e["ra"][1])
+                    s2 = project_to_canvas(e["rb"][0], e["rb"][1])
+                    screen_len = math.hypot(s2[0] - s1[0], s2[1] - s1[1])
+                    if screen_len < 8:
+                        continue
+
+                    vx, vy, vz = e["vec"]
+                    edge_len = max(e["len"], 1e-9)
+                    axis_align = 0.0
+                    if desired_idx is not None:
+                        axis_align = abs((vx, vy, vz)[desired_idx]) / edge_len
+
+                    # Strongly favor axis alignment, then visibility.
+                    depth = (e["ra"][2] + e["rb"][2]) * 0.5
+                    score = axis_align * 100.0 + screen_len * 0.1 + depth * 0.3
+
+                    # Require decent alignment when axis is known.
+                    if desired_idx is not None and axis_align < 0.45:
+                        continue
+
+                    if best_score is None or score > best_score:
+                        best_score = score
+                        best_i = i
+
+                if best_i is None:
+                    continue
+
+                used.add(best_i)
+                edge = edges[best_i]
+                s1 = project_to_canvas(edge["ra"][0], edge["ra"][1])
+                s2 = project_to_canvas(edge["rb"][0], edge["rb"][1])
+                self.preview_canvas.create_line(
+                    s1[0], s1[1], s2[0], s2[1], fill=target["color"], width=4
+                )
 
     def _draw_preview_message(self, message):
         self.preview_canvas.delete("all")
@@ -530,6 +656,79 @@ class ParametricGenerator:
         except Exception:
             pass
         self.root.destroy()
+
+    def _parameter_color(self, label, index):
+        name = label.strip().lower()
+        if "length" in name:
+            return AXIS_COLORS["x"]
+        if "width" in name:
+            return AXIS_COLORS["y"]
+        if "height" in name:
+            return AXIS_COLORS["z"]
+        fallback = ["#ffcc66", "#c792ea", "#80cbc4", "#f78c6c"]
+        return fallback[index % len(fallback)]
+
+    def _parse_numeric_value(self, text):
+        if text is None:
+            return None
+        s = str(text).strip().replace(",", "")
+        m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
+        if not m:
+            return None
+        try:
+            return abs(float(m.group(0)))
+        except Exception:
+            return None
+
+    def _parameter_edge_targets(self):
+        targets = []
+
+        # Prefer named dimensions first.
+        named_order = [("length", "x"), ("width", "y"), ("height", "z")]
+        used = set()
+        for keyword, axis in named_order:
+            for i, p in enumerate(self.parameter_entries):
+                if i in used:
+                    continue
+                name = p["label"].strip().lower()
+                if keyword in name:
+                    num = self._parse_numeric_value(p["var"].get())
+                    if num and num > 0:
+                        targets.append(
+                            {
+                                "axis": axis,
+                                "value": num,
+                                "color": AXIS_COLORS[axis],
+                                "index": i,
+                            }
+                        )
+                        used.add(i)
+                    break
+
+        # Fallback: first remaining numeric params.
+        if not targets:
+            fallback_axes = ["x", "y", "z"]
+            for i, p in enumerate(self.parameter_entries):
+                if i in used:
+                    continue
+                lname = p["label"].strip().lower()
+                if "scale" in lname:
+                    continue
+                num = self._parse_numeric_value(p["var"].get())
+                if num and num > 0:
+                    axis = fallback_axes[len(targets) % len(fallback_axes)]
+                    targets.append(
+                        {
+                            "axis": axis,
+                            "value": num,
+                            "color": AXIS_COLORS[axis],
+                            "index": i,
+                        }
+                    )
+                if len(targets) >= 3:
+                    break
+
+        return targets
 
     # ------------------------------------------------------------------------
     # FREECAD SCRIPT EXECUTION
