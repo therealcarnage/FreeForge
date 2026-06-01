@@ -9,7 +9,9 @@ A minimal Windows desktop app that updates FreeCAD spreadsheet inputs and export
 # ============================================================================
 
 import json
+import math
 import os
+import struct
 import subprocess
 import sys
 import textwrap
@@ -26,7 +28,8 @@ APP_GEOMETRY = "600x700"
 
 FREECAD_TIMEOUT = 120
 PARAM_SCAN_TIMEOUT = 60
-RUNNER_SCRIPT_NAME = "_runner.py"
+PREVIEW_TIMEOUT = 60
+PREVIEW_STL_NAME = "_preview.stl"
 
 FREECAD_FILETYPES = [("FreeCAD files", "*.FCStd"), ("All files", "*.*")]
 EXECUTABLE_FILETYPES = [("Executable files", "*.exe"), ("All files", "*.*")]
@@ -58,8 +61,16 @@ class ParametricGenerator:
         self.freecad_path = tk.StringVar()
         self.parameter_entries = []
 
+        self.preview_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), PREVIEW_STL_NAME)
+        self.preview_triangles = []
+        self.preview_yaw = -0.7
+        self.preview_pitch = 0.45
+        self.preview_after_id = None
+        self.preview_drag_last = None
+
         self._auto_detect_freecad()
         self._setup_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------------
     # UI SETUP
@@ -96,6 +107,20 @@ class ParametricGenerator:
         self.generate_btn.grid(row=row, column=0, columnspan=3, pady=20, sticky=(tk.W, tk.E))
         row += 1
 
+        self.preview_frame = ttk.LabelFrame(main, text="Live Preview", padding="5")
+        self.preview_frame.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N), pady=5)
+        self.preview_frame.columnconfigure(0, weight=1)
+
+        self.preview_canvas = tk.Canvas(self.preview_frame, height=220, bg="#121212", highlightthickness=1)
+        self.preview_canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.preview_frame.rowconfigure(0, weight=1)
+
+        self.preview_canvas.bind("<Configure>", lambda _e: self._render_preview())
+        self.preview_canvas.bind("<ButtonPress-1>", self._on_preview_press)
+        self.preview_canvas.bind("<B1-Motion>", self._on_preview_drag)
+        self._draw_preview_message("Preview will appear here")
+        row += 1
+
         ttk.Label(main, text="Status:").grid(row=row, column=0, sticky=(tk.W, tk.N), pady=5)
         row += 1
 
@@ -119,6 +144,7 @@ class ParametricGenerator:
         if filename:
             self.template_path.set(filename)
             self._load_parameters_from_template()
+            self._schedule_preview()
 
     def _browse_output(self):
         folder = filedialog.askdirectory(title="Select Output Folder")
@@ -222,6 +248,7 @@ class ParametricGenerator:
             value = str(item.get("value", ""))
 
             var = tk.StringVar(value=value)
+            var.trace_add("write", lambda *_: self._schedule_preview())
             ttk.Label(self.params_frame, text=f"{label} (Row {row_number}):").grid(
                 row=i, column=0, sticky=tk.W, padx=5, pady=2
             )
@@ -230,6 +257,8 @@ class ParametricGenerator:
             )
 
             self.parameter_entries.append({"row": row_number, "label": label, "var": var})
+
+        self._schedule_preview()
 
     # ------------------------------------------------------------------------
     # GENERATION
@@ -296,10 +325,6 @@ class ParametricGenerator:
                     self._log(f"X {err}")
                 return
 
-            runner_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), RUNNER_SCRIPT_NAME)
-            with open(runner_path, "w", encoding="utf-8") as f:
-                f.write(self._create_runner_script())
-
             self._log("Running...")
             result = self._run_freecad_script(
                 self._create_runner_script(),
@@ -314,6 +339,7 @@ class ParametricGenerator:
 
             if result.returncode == 0:
                 self._log("Done")
+                self._schedule_preview()
             else:
                 self._log("Failed")
                 if result.stderr:
@@ -322,16 +348,188 @@ class ParametricGenerator:
         except Exception as exc:
             self._log(f"X Unexpected error: {exc}")
         finally:
-            self._cleanup_temp_files()
             self._set_ui_state(True)
 
-    def _cleanup_temp_files(self):
+    # ------------------------------------------------------------------------
+    # LIVE PREVIEW
+    # ------------------------------------------------------------------------
+
+    def _schedule_preview(self):
+        if self.preview_after_id is not None:
+            self.root.after_cancel(self.preview_after_id)
+        self.preview_after_id = self.root.after(650, self._run_live_preview)
+
+    def _run_live_preview(self):
+        self.preview_after_id = None
+
+        if not self.template_path.get() or not os.path.isfile(self.template_path.get()):
+            self._draw_preview_message("Select a template to preview")
+            return
+        if not self.freecad_path.get() or not os.path.isfile(self.freecad_path.get()):
+            self._draw_preview_message("Select FreeCADCmd.exe")
+            return
+        if not self.parameter_entries:
+            self._draw_preview_message("No parameters loaded")
+            return
+
+        env = os.environ.copy()
+        env["FREECAD_TEMPLATE"] = self.template_path.get()
+        env["FREECAD_PARAMS_JSON"] = json.dumps(
+            [{"row": p["row"], "value": p["var"].get()} for p in self.parameter_entries]
+        )
+        env["FREECAD_PREVIEW_PATH"] = self.preview_path
+
+        result = self._run_freecad_script(
+            self._create_runner_script(),
+            env=env,
+            cwd=os.path.dirname(self.template_path.get()),
+            timeout=PREVIEW_TIMEOUT,
+        )
+
+        if result is None or result.returncode != 0:
+            self._draw_preview_message("Preview failed")
+            return
+        if not os.path.isfile(self.preview_path):
+            self._draw_preview_message("No preview mesh generated")
+            return
+
+        triangles = self._load_stl_triangles(self.preview_path)
+        if not triangles:
+            self._draw_preview_message("Preview mesh is empty")
+            return
+
+        self.preview_triangles = triangles
+        self._render_preview()
+
+    def _load_stl_triangles(self, file_path, max_triangles=4000):
         try:
-            runner_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), RUNNER_SCRIPT_NAME)
-            if os.path.exists(runner_path):
-                os.remove(runner_path)
+            with open(file_path, "rb") as f:
+                data = f.read()
+            if len(data) < 84:
+                return []
+
+            tri_count = struct.unpack("<I", data[80:84])[0]
+            expected = 84 + tri_count * 50
+
+            triangles = []
+            if expected == len(data):
+                offset = 84
+                for _ in range(tri_count):
+                    offset += 12  # normal
+                    v1 = struct.unpack("<fff", data[offset : offset + 12])
+                    offset += 12
+                    v2 = struct.unpack("<fff", data[offset : offset + 12])
+                    offset += 12
+                    v3 = struct.unpack("<fff", data[offset : offset + 12])
+                    offset += 12
+                    offset += 2  # attr
+                    triangles.append((v1, v2, v3))
+            else:
+                text = data.decode("utf-8", errors="ignore")
+                verts = []
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line.lower().startswith("vertex "):
+                        parts = line.split()
+                        if len(parts) == 4:
+                            verts.append((float(parts[1]), float(parts[2]), float(parts[3])))
+                for i in range(0, len(verts) - 2, 3):
+                    triangles.append((verts[i], verts[i + 1], verts[i + 2]))
+
+            if len(triangles) > max_triangles:
+                step = max(1, len(triangles) // max_triangles)
+                triangles = triangles[::step]
+
+            return triangles
+        except Exception:
+            return []
+
+    def _render_preview(self):
+        self.preview_canvas.delete("all")
+
+        if not self.preview_triangles:
+            self._draw_preview_message("Preview will appear here")
+            return
+
+        width = max(10, self.preview_canvas.winfo_width())
+        height = max(10, self.preview_canvas.winfo_height())
+
+        points = [p for tri in self.preview_triangles for p in tri]
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        zs = [p[2] for p in points]
+
+        cx = (min(xs) + max(xs)) * 0.5
+        cy = (min(ys) + max(ys)) * 0.5
+        cz = (min(zs) + max(zs)) * 0.5
+
+        span = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs), 1e-6)
+        scale = min(width, height) * 0.72 / span
+
+        cos_y = math.cos(self.preview_yaw)
+        sin_y = math.sin(self.preview_yaw)
+        cos_x = math.cos(self.preview_pitch)
+        sin_x = math.sin(self.preview_pitch)
+
+        faces = []
+        for tri in self.preview_triangles:
+            projected = []
+            depth_accum = 0.0
+            for vx, vy, vz in tri:
+                x = vx - cx
+                y = vy - cy
+                z = vz - cz
+
+                xz_x = x * cos_y + z * sin_y
+                xz_z = -x * sin_y + z * cos_y
+                yz_y = y * cos_x - xz_z * sin_x
+                yz_z = y * sin_x + xz_z * cos_x
+
+                sx = width * 0.5 + xz_x * scale
+                sy = height * 0.5 - yz_y * scale
+                projected.append((sx, sy, yz_z))
+                depth_accum += yz_z
+
+            z_avg = depth_accum / 3.0
+            faces.append((z_avg, projected))
+
+        faces.sort(key=lambda item: item[0])
+
+        for z_avg, tri in faces:
+            flat = [coord for p in tri for coord in (p[0], p[1])]
+            shade = int(max(45, min(220, 140 + z_avg * 22)))
+            color = f"#{shade:02x}{shade:02x}{shade:02x}"
+            self.preview_canvas.create_polygon(flat, fill=color, outline="#2a2a2a", width=1)
+
+    def _draw_preview_message(self, message):
+        self.preview_canvas.delete("all")
+        w = max(10, self.preview_canvas.winfo_width())
+        h = max(10, self.preview_canvas.winfo_height())
+        self.preview_canvas.create_text(w // 2, h // 2, text=message, fill="#d0d0d0")
+
+    def _on_preview_press(self, event):
+        self.preview_drag_last = (event.x, event.y)
+
+    def _on_preview_drag(self, event):
+        if self.preview_drag_last is None:
+            self.preview_drag_last = (event.x, event.y)
+            return
+        last_x, last_y = self.preview_drag_last
+        dx = event.x - last_x
+        dy = event.y - last_y
+        self.preview_drag_last = (event.x, event.y)
+
+        self.preview_yaw += dx * 0.01
+        self.preview_pitch += dy * 0.01
+        self._render_preview()
+
+    def _on_close(self):
+        try:
+            if os.path.exists(self.preview_path):
+                os.remove(self.preview_path)
         except Exception:
             pass
+        self.root.destroy()
 
     # ------------------------------------------------------------------------
     # FREECAD SCRIPT EXECUTION
@@ -364,9 +562,10 @@ class ParametricGenerator:
 
             try:
                 template_file = os.environ['FREECAD_TEMPLATE']
-                output_folder = os.environ['FREECAD_OUTPUT']
-                filename_base = os.environ['FREECAD_BASE']
                 params = json.loads(os.environ['FREECAD_PARAMS_JSON'])
+                output_folder = os.environ.get('FREECAD_OUTPUT', '')
+                filename_base = os.environ.get('FREECAD_BASE', '')
+                preview_path = os.environ.get('FREECAD_PREVIEW_PATH', '')
 
                 import FreeCAD
                 import Mesh
@@ -401,8 +600,11 @@ class ParametricGenerator:
 
                 for obj in doc.Objects:
                     if obj.Name == 'Body':
-                        stl_file = os.path.join(output_folder, f"{filename_base}.stl")
-                        Mesh.export([obj], stl_file)
+                        if preview_path:
+                            Mesh.export([obj], preview_path)
+                        elif output_folder and filename_base:
+                            stl_file = os.path.join(output_folder, f"{filename_base}.stl")
+                            Mesh.export([obj], stl_file)
                         break
 
                 FreeCAD.closeDocument(doc.Name)
