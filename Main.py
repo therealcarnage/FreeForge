@@ -32,6 +32,8 @@ PARAM_SCAN_TIMEOUT = 60
 PREVIEW_TIMEOUT = 60
 PREVIEW_STL_NAME = "_preview.stl"
 PREVIEW_MARGIN = 18
+EDGE_LENGTH_TOLERANCE = 0.12
+EDGE_AXIS_ALIGNMENT = 0.90
 
 AXIS_COLORS = {
     "x": "#ff4d4d",  # red
@@ -529,29 +531,143 @@ class ParametricGenerator:
             sy = height * 0.5 - (ry - center_py) * scale
             return sx, sy
 
+        light_dir = (-0.45, -0.35, 0.82)
+        light_len = math.sqrt(
+            light_dir[0] * light_dir[0] + light_dir[1] * light_dir[1] + light_dir[2] * light_dir[2]
+        )
+        lx, ly, lz = (
+            light_dir[0] / light_len,
+            light_dir[1] / light_len,
+            light_dir[2] / light_len,
+        )
+
         faces = []
         for tri in rotated_faces:
             projected = []
             depth_accum = 0.0
+            rot_pts = []
             for rx, ry, rz in tri:
                 sx, sy = project_to_canvas(rx, ry)
                 projected.append((sx, sy, rz))
                 depth_accum += rz
+                rot_pts.append((rx, ry, rz))
 
             z_avg = depth_accum / 3.0
-            faces.append((z_avg, projected))
+            faces.append((z_avg, projected, rot_pts))
+
+        # Compute one shade per geometric plane so split triangles on a flat
+        # face cannot produce seams or flicker.
+        plane_shades = {}
+        for ctri, rtri in zip(centered_faces, rotated_faces):
+            ca, cb, cc = ctri
+            cux, cuy, cuz = (cb[0] - ca[0], cb[1] - ca[1], cb[2] - ca[2])
+            cvx, cvy, cvz = (cc[0] - ca[0], cc[1] - ca[1], cc[2] - ca[2])
+            cnx = cuy * cvz - cuz * cvy
+            cny = cuz * cvx - cux * cvz
+            cnz = cux * cvy - cuy * cvx
+            cn_len = math.sqrt(cnx * cnx + cny * cny + cnz * cnz)
+            if cn_len < 1e-9:
+                continue
+
+            cnx, cny, cnz = cnx / cn_len, cny / cn_len, cnz / cn_len
+            d = -(cnx * ca[0] + cny * ca[1] + cnz * ca[2])
+
+            # Canonical orientation keeps opposite-winding triangles together
+            # on the same plane.
+            if (
+                cnx < -1e-9
+                or (abs(cnx) <= 1e-9 and cny < -1e-9)
+                or (abs(cnx) <= 1e-9 and abs(cny) <= 1e-9 and cnz < -1e-9)
+            ):
+                cnx, cny, cnz, d = -cnx, -cny, -cnz, -d
+
+            plane_key = (round(cnx, 4), round(cny, 4), round(cnz, 4), round(d, 4))
+            if plane_key in plane_shades:
+                continue
+
+            ra, rb, rc = rtri
+            rux, ruy, ruz = (rb[0] - ra[0], rb[1] - ra[1], rb[2] - ra[2])
+            rvx, rvy, rvz = (rc[0] - ra[0], rc[1] - ra[1], rc[2] - ra[2])
+            rnx = ruy * rvz - ruz * rvy
+            rny = ruz * rvx - rux * rvz
+            rnz = rux * rvy - ruy * rvx
+            rn_len = math.sqrt(rnx * rnx + rny * rny + rnz * rnz)
+
+            if rn_len > 1e-9:
+                rnx, rny, rnz = rnx / rn_len, rny / rn_len, rnz / rn_len
+                ndotl = abs(rnx * lx + rny * ly + rnz * lz)
+            else:
+                ndotl = 0.0
+
+            intensity = 0.56 + 0.44 * ndotl
+            shade = int(max(128, min(226, 95 + intensity * 135)))
+            plane_shades[plane_key] = shade
+
+        z_values = [p[2] for _, tri, _ in faces for p in tri]
+        depth_range = max(z_values) - min(z_values) if z_values else 1.0
+        depth_tolerance = max(1e-6, depth_range * 0.003)
+
+        def depth_at_point_on_triangle(px, py, tri):
+            (x1, y1, z1), (x2, y2, z2), (x3, y3, z3) = tri
+            denom = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+            if abs(denom) < 1e-9:
+                return None
+
+            l1 = ((y2 - y3) * (px - x3) + (x3 - x2) * (py - y3)) / denom
+            l2 = ((y3 - y1) * (px - x3) + (x1 - x3) * (py - y3)) / denom
+            l3 = 1.0 - l1 - l2
+
+            if l1 < -1e-4 or l2 < -1e-4 or l3 < -1e-4:
+                return None
+
+            return l1 * z1 + l2 * z2 + l3 * z3
 
         faces.sort(key=lambda item: item[0])
 
-        for z_avg, tri in faces:
+        for _z_avg, tri, rot_pts in faces:
             flat = [coord for p in tri for coord in (p[0], p[1])]
-            shade = int(max(45, min(220, 140 + z_avg * 22)))
-            color = f"#{shade:02x}{shade:02x}{shade:02x}"
-            self.preview_canvas.create_polygon(flat, fill=color, outline="#2a2a2a", width=1)
 
-        # Highlight existing mesh edges mapped by axis, not just by length.
+            a, b, c = rot_pts
+            ux, uy, uz = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+            vx, vy, vz = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+            nx = uy * vz - uz * vy
+            ny = uz * vx - ux * vz
+            nz = ux * vy - uy * vx
+            n_len = math.sqrt(nx * nx + ny * ny + nz * nz)
+            if n_len > 1e-9:
+                nx, ny, nz = nx / n_len, ny / n_len, nz / n_len
+            else:
+                nx, ny, nz = 0.0, 0.0, 1.0
+
+            d = -(nx * a[0] + ny * a[1] + nz * a[2])
+            if (
+                nx < -1e-9
+                or (abs(nx) <= 1e-9 and ny < -1e-9)
+                or (abs(nx) <= 1e-9 and abs(ny) <= 1e-9 and nz < -1e-9)
+            ):
+                nx, ny, nz, d = -nx, -ny, -nz, -d
+
+            shade = plane_shades.get((round(nx, 4), round(ny, 4), round(nz, 4), round(d, 4)), 186)
+
+            face_color = f"#{shade:02x}{shade:02x}{shade:02x}"
+            self.preview_canvas.create_polygon(flat, fill=face_color, outline=face_color, width=1)
+
+        # Build real feature edges from triangle adjacency.
         edge_map = {}
         for ctri, rtri in zip(centered_faces, rotated_faces):
+            # Face normal in centered model space.
+            a0, b0, c0 = ctri
+            ux, uy, uz = (b0[0] - a0[0], b0[1] - a0[1], b0[2] - a0[2])
+            vx, vy, vz = (c0[0] - a0[0], c0[1] - a0[1], c0[2] - a0[2])
+            fnx = uy * vz - uz * vy
+            fny = uz * vx - ux * vz
+            fnz = ux * vy - uy * vx
+            fn_len = math.sqrt(fnx * fnx + fny * fny + fnz * fnz)
+            if fn_len > 1e-9:
+                face_normal = (fnx / fn_len, fny / fn_len, fnz / fn_len)
+            else:
+                face_normal = (0.0, 0.0, 0.0)
+
             for a, b in ((0, 1), (1, 2), (2, 0)):
                 pa = ctri[a]
                 pb = ctri[b]
@@ -561,71 +677,79 @@ class ParametricGenerator:
                 ka = (round(pa[0], 6), round(pa[1], 6), round(pa[2], 6))
                 kb = (round(pb[0], 6), round(pb[1], 6), round(pb[2], 6))
                 key = tuple(sorted((ka, kb)))
-                if key in edge_map:
-                    continue
-
                 dx = pa[0] - pb[0]
                 dy = pa[1] - pb[1]
                 dz = pa[2] - pb[2]
                 edge_len = math.sqrt(dx * dx + dy * dy + dz * dz)
-                edge_map[key] = {
-                    "len": edge_len,
-                    "vec": (dx, dy, dz),
-                    "ra": ra,
-                    "rb": rb,
-                }
+                if key not in edge_map:
+                    edge_map[key] = {
+                        "len": edge_len,
+                        "vec": (dx, dy, dz),
+                        "ra": ra,
+                        "rb": rb,
+                        "count": 1,
+                        "normals": [face_normal],
+                    }
+                else:
+                    edge_map[key]["count"] += 1
+                    edge_map[key]["normals"].append(face_normal)
 
         targets = self._parameter_edge_targets()
         if targets and edge_map:
             edges = list(edge_map.values())
-            used = set()
             axis_idx = {"x": 0, "y": 1, "z": 2}
 
             for target in targets:
-                best_i = None
-                best_score = None
-
                 desired_axis = target.get("axis")
                 desired_idx = axis_idx.get(desired_axis, None)
 
-                for i, e in enumerate(edges):
-                    if i in used:
-                        continue
+                # Stable rule: highlight all matching mesh edges for this parameter.
+                for edge in edges:
+                    # Keep only real feature edges and ignore triangulation diagonals.
+                    if edge["count"] >= 2 and len(edge["normals"]) >= 2:
+                        n1 = edge["normals"][0]
+                        n2 = edge["normals"][1]
+                        dot = n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2]
+                        # Coplanar shared edges are mesh diagonals; skip them.
+                        if abs(dot) > 0.98:
+                            continue
 
-                    s1 = project_to_canvas(e["ra"][0], e["ra"][1])
-                    s2 = project_to_canvas(e["rb"][0], e["rb"][1])
+                    s1 = project_to_canvas(edge["ra"][0], edge["ra"][1])
+                    s2 = project_to_canvas(edge["rb"][0], edge["rb"][1])
                     screen_len = math.hypot(s2[0] - s1[0], s2[1] - s1[1])
                     if screen_len < 8:
                         continue
 
-                    vx, vy, vz = e["vec"]
-                    edge_len = max(e["len"], 1e-9)
-                    axis_align = 0.0
-                    if desired_idx is not None:
-                        axis_align = abs((vx, vy, vz)[desired_idx]) / edge_len
-
-                    # Strongly favor axis alignment, then visibility.
-                    depth = (e["ra"][2] + e["rb"][2]) * 0.5
-                    score = axis_align * 100.0 + screen_len * 0.1 + depth * 0.3
-
-                    # Require decent alignment when axis is known.
-                    if desired_idx is not None and axis_align < 0.45:
+                    rel_len_err = abs(edge["len"] - target["value"]) / max(target["value"], 1e-9)
+                    if rel_len_err > EDGE_LENGTH_TOLERANCE:
                         continue
 
-                    if best_score is None or score > best_score:
-                        best_score = score
-                        best_i = i
+                    if desired_idx is not None:
+                        vx, vy, vz = edge["vec"]
+                        axis_align = abs((vx, vy, vz)[desired_idx]) / max(edge["len"], 1e-9)
+                        if axis_align < EDGE_AXIS_ALIGNMENT:
+                            continue
 
-                if best_i is None:
-                    continue
+                    # Hide edges that are occluded by a nearer face so the model
+                    # reads as a solid and never as see-through.
+                    mx = (s1[0] + s2[0]) * 0.5
+                    my = (s1[1] + s2[1]) * 0.5
+                    edge_depth = (edge["ra"][2] + edge["rb"][2]) * 0.5
 
-                used.add(best_i)
-                edge = edges[best_i]
-                s1 = project_to_canvas(edge["ra"][0], edge["ra"][1])
-                s2 = project_to_canvas(edge["rb"][0], edge["rb"][1])
-                self.preview_canvas.create_line(
-                    s1[0], s1[1], s2[0], s2[1], fill=target["color"], width=4
-                )
+                    nearest_depth = None
+                    for _zavg, face_tri, _rot in faces:
+                        z_at_mid = depth_at_point_on_triangle(mx, my, face_tri)
+                        if z_at_mid is None:
+                            continue
+                        if nearest_depth is None or z_at_mid > nearest_depth:
+                            nearest_depth = z_at_mid
+
+                    if nearest_depth is not None and (nearest_depth - edge_depth) > depth_tolerance:
+                        continue
+
+                    self.preview_canvas.create_line(
+                        s1[0], s1[1], s2[0], s2[1], fill=target["color"], width=4
+                    )
 
     def _draw_preview_message(self, message):
         self.preview_canvas.delete("all")
