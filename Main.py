@@ -16,6 +16,7 @@ Date: January 2026
 import os
 import sys
 import json
+import textwrap
 import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
@@ -438,7 +439,11 @@ class ParametricGenerator:
         environment = os.environ.copy()
         
         params_payload = [
-            {"row": p["row"], "value": p["var"].get()}
+            {
+                "row": p["row"],
+                "label": p["label"],
+                "value": p["var"].get(),
+            }
             for p in self.parameter_entries
         ]
 
@@ -572,9 +577,10 @@ class ParametricGenerator:
             row_number = int(item.get("row", 0))
             label_text = str(item.get("label", "")).strip() or f"Parameter {row_number}"
             value_text = str(item.get("value", ""))
+            cell_ref = str(item.get("cell", f"C{row_number}"))
 
             var = tk.StringVar(value=value_text)
-            display_label = f"{label_text} (B{row_number}):"
+            display_label = f"{label_text} ({cell_ref}):"
 
             ttk.Label(self.params_frame, text=display_label).grid(
                 row=i, column=0, sticky=tk.W, padx=5, pady=2
@@ -583,7 +589,13 @@ class ParametricGenerator:
                 row=i, column=1, sticky=(tk.W, tk.E), padx=5, pady=2
             )
 
-            self.parameter_entries.append({"row": row_number, "label": label_text, "var": var})
+            self.parameter_entries.append(
+                {
+                    "row": row_number,
+                    "label": label_text,
+                    "var": var,
+                }
+            )
     
     # ───────────────────────────────────────────────────────────────────────────
     # FREECAD SCRIPT GENERATION
@@ -596,106 +608,146 @@ class ParametricGenerator:
         Returns:
             str: Complete Python script for FreeCAD execution
         """
-        return '''import sys
-import os
-import json
+        return textwrap.dedent('''
+            import sys
+            import os
+            import json
 
-try:
-    template_file = os.environ['FREECAD_TEMPLATE']
-    output_folder = os.environ['FREECAD_OUTPUT']
-    filename_base = os.environ['FREECAD_BASE']
-    params_json = os.environ['FREECAD_PARAMS_JSON']
-    params = json.loads(params_json)
-
-    import FreeCAD
-
-    doc = FreeCAD.openDocument(template_file)
-
-    for obj in doc.Objects:
-        if hasattr(obj, 'TypeId') and obj.TypeId == 'Spreadsheet::Sheet':
             try:
-                for item in params:
-                    row = int(item['row'])
-                    value = str(item['value'])
-                    obj.set(f'B{row}', value)
-            except Exception:
-                pass
-            break
+                template_file = os.environ['FREECAD_TEMPLATE']
+                output_folder = os.environ['FREECAD_OUTPUT']
+                filename_base = os.environ['FREECAD_BASE']
+                params_json = os.environ['FREECAD_PARAMS_JSON']
+                params = json.loads(params_json)
 
-    doc.recompute()
+                import FreeCAD
 
-    for obj in doc.Objects:
-        if obj.Name == "Body":
-            import Mesh
-            stl_file_path = os.path.join(output_folder, f"{filename_base}.stl")
-            Mesh.export([obj], stl_file_path)
-            break
+                doc = FreeCAD.openDocument(template_file)
 
-    FreeCAD.closeDocument(doc.Name)
+                for obj in doc.Objects:
+                    if hasattr(obj, 'TypeId') and obj.TypeId == 'Spreadsheet::Sheet':
+                        try:
+                            for item in params:
+                                row = int(item['row'])
+                                value = str(item['value'])
 
-except Exception as e:
-    print(f"Error: {e}")
-    sys.exit(1)
-'''
+                                # Keep it simple: write to Input column C, fallback to Output column B.
+                                wrote = False
+                                try:
+                                    obj.set(f'C{row}', value)
+                                    wrote = True
+                                except Exception:
+                                    pass
+
+                                if not wrote:
+                                    try:
+                                        obj.set(f'B{row}', value)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                        break
+
+                doc.recompute()
+
+                for obj in doc.Objects:
+                    if obj.Name == "Body":
+                        import Mesh
+                        stl_file_path = os.path.join(output_folder, f"{filename_base}.stl")
+                        Mesh.export([obj], stl_file_path)
+                        break
+
+                FreeCAD.closeDocument(doc.Name)
+
+            except Exception as e:
+                print(f"Error: {e}")
+                sys.exit(1)
+        ''').strip() + "\n"
 
     def _create_param_scan_script_content(self):
         """Generate a FreeCAD script that reads labels from A and values from B starting at row 2."""
-        return '''import os
-import sys
-import json
-
-try:
-    template_file = os.environ['FREECAD_TEMPLATE']
-    import FreeCAD
-
-    doc = FreeCAD.openDocument(template_file)
-    rows = []
-
-    sheet = None
-    for obj in doc.Objects:
-        if hasattr(obj, 'TypeId') and obj.TypeId == 'Spreadsheet::Sheet':
-            sheet = obj
-            break
-
-    if sheet is not None:
-        row = 2
-        while True:
-            try:
-                b_value = sheet.get(f'B{row}')
-            except Exception:
-                b_value = ''
-
-            if b_value is None or str(b_value).strip() == '':
-                break
+        return textwrap.dedent('''
+            import os
+            import sys
+            import json
 
             try:
-                a_label = sheet.get(f'A{row}')
+                template_file = os.environ['FREECAD_TEMPLATE']
+                import FreeCAD
+
+                doc = FreeCAD.openDocument(template_file)
+                rows = []
+
+                sheet = None
+                for obj in doc.Objects:
+                    if hasattr(obj, 'TypeId') and obj.TypeId == 'Spreadsheet::Sheet':
+                        sheet = obj
+                        break
+
+                if sheet is not None:
+                    row = 2
+                    while True:
+                        try:
+                            b_value = sheet.get(f'B{row}')
+                        except Exception:
+                            b_value = ''
+
+                        if b_value is None or str(b_value).strip() == '':
+                            break
+
+                        try:
+                            a_label = sheet.get(f'A{row}')
+                        except Exception:
+                            a_label = ''
+
+                        output_cell = f'B{row}'
+                        input_cell = f'C{row}'
+
+                        try:
+                            input_contents = sheet.getContents(input_cell)
+                        except Exception:
+                            input_contents = ''
+
+                        try:
+                            input_value = sheet.get(input_cell)
+                        except Exception:
+                            input_value = ''
+
+                        # Prefer explicit input column C when present.
+                        target_cell = output_cell
+                        use_input_column = str(input_contents).strip() != '' or str(input_value).strip() != ''
+                        if use_input_column:
+                            target_cell = input_cell
+
+                        label = str(a_label).strip() if a_label is not None else ''
+                        if not label:
+                            label = f'Parameter {row}'
+
+                        # Show/edit the source value from the chosen target cell.
+                        value_for_ui = b_value
+                        if target_cell == input_cell and str(input_value).strip() != '':
+                            value_for_ui = input_value
+
+                        rows.append({
+                            'row': row,
+                            'label': label,
+                            'cell': target_cell,
+                            'value': str(value_for_ui)
+                        })
+                        row += 1
+
+                print('PARAM_SCAN_BEGIN')
+                print(json.dumps(rows))
+                print('PARAM_SCAN_END')
+
+                if doc is not None:
+                    FreeCAD.closeDocument(doc.Name)
             except Exception:
-                a_label = ''
-
-            label = str(a_label).strip() if a_label is not None else ''
-            if not label:
-                label = f'Parameter {row}'
-
-            rows.append({
-                'row': row,
-                'label': label,
-                'value': str(b_value)
-            })
-            row += 1
-
-    print('PARAM_SCAN_BEGIN')
-    print(json.dumps(rows))
-    print('PARAM_SCAN_END')
-
-    if doc is not None:
-        FreeCAD.closeDocument(doc.Name)
-except Exception:
-    print('PARAM_SCAN_BEGIN')
-    print('[]')
-    print('PARAM_SCAN_END')
-    sys.exit(1)
-'''
+                print('PARAM_SCAN_BEGIN')
+                print('[]')
+                print('PARAM_SCAN_END')
+                sys.exit(1)
+        ''').strip() + "\n"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
