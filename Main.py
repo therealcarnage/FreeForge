@@ -19,6 +19,8 @@ import textwrap
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, ttk
 
+import pyvista as pv
+
 # ============================================================================
 # GLOBAL CONFIGURATION
 # ============================================================================
@@ -31,6 +33,7 @@ FREECAD_TIMEOUT = 120
 PARAM_SCAN_TIMEOUT = 60
 PREVIEW_TIMEOUT = 60
 PREVIEW_STL_NAME = "_preview.stl"
+PREVIEW_IMAGE_NAME = "_preview.png"
 PREVIEW_MARGIN = 18
 EDGE_LENGTH_TOLERANCE = 0.12
 EDGE_AXIS_ALIGNMENT = 0.90
@@ -72,15 +75,19 @@ class ParametricGenerator:
         self.parameter_entries = []
 
         self.preview_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), PREVIEW_STL_NAME)
+        self.preview_image_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), PREVIEW_IMAGE_NAME)
         self.preview_triangles = []
         self.preview_yaw = -0.7
         self.preview_pitch = 0.45
         self.preview_after_id = None
         self.preview_drag_last = None
+        self.preview_photo = None
+        self._pyvista_error_logged = False
 
         self._auto_detect_freecad()
         self._setup_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._log("Preview renderer: PyVista/VTK (realistic)")
 
     # ------------------------------------------------------------------------
     # UI SETUP
@@ -417,6 +424,92 @@ class ParametricGenerator:
         self.preview_triangles = triangles
         self._render_preview()
 
+    def _render_preview_pyvista(self, width, height):
+        if not os.path.isfile(self.preview_path):
+            return False
+
+        plotter = None
+        try:
+            mesh = pv.read(self.preview_path)
+            if mesh is None or mesh.n_points == 0:
+                return False
+
+            win_w = max(120, int(width))
+            win_h = max(120, int(height))
+            plotter = pv.Plotter(off_screen=True, window_size=(win_w, win_h), lighting="none")
+            plotter.set_background("#101216")
+
+            mesh_color = "#d6d9de"
+            plotter.add_mesh(
+                mesh,
+                color=mesh_color,
+                smooth_shading=True,
+                ambient=0.25,
+                diffuse=0.75,
+                specular=0.35,
+                specular_power=24,
+                show_edges=False,
+            )
+
+            # Subtle silhouette/feature edges to keep shape readability.
+            try:
+                feature_edges = mesh.extract_feature_edges(
+                    boundary_edges=True,
+                    feature_edges=True,
+                    manifold_edges=False,
+                    non_manifold_edges=False,
+                    feature_angle=35,
+                )
+                if feature_edges is not None and feature_edges.n_points > 0:
+                    plotter.add_mesh(feature_edges, color="#6f7882", line_width=1)
+            except Exception:
+                pass
+
+            key = pv.Light(position=(3.2, 2.4, 4.1), focal_point=(0.0, 0.0, 0.0), color="white", intensity=1.0)
+            fill = pv.Light(position=(-3.0, 1.8, 1.4), focal_point=(0.0, 0.0, 0.0), color="#d8deea", intensity=0.55)
+            rim = pv.Light(position=(0.0, -4.0, 2.2), focal_point=(0.0, 0.0, 0.0), color="#f6f8ff", intensity=0.25)
+            plotter.add_light(key)
+            plotter.add_light(fill)
+            plotter.add_light(rim)
+
+            xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
+            dx = xmax - xmin
+            dy = ymax - ymin
+            dz = zmax - zmin
+            diag = max(1e-6, math.sqrt(dx * dx + dy * dy + dz * dz))
+            dist = diag * 2.2
+            center = mesh.center
+
+            cam_x = center[0] + dist * math.cos(self.preview_pitch) * math.sin(self.preview_yaw)
+            cam_y = center[1] + dist * math.sin(self.preview_pitch)
+            cam_z = center[2] + dist * math.cos(self.preview_pitch) * math.cos(self.preview_yaw)
+            plotter.camera_position = [(cam_x, cam_y, cam_z), center, (0.0, 1.0, 0.0)]
+            plotter.camera.SetViewAngle(30)
+
+            plotter.show(auto_close=False)
+            plotter.screenshot(filename=self.preview_image_path, transparent_background=False)
+            plotter.close()
+            plotter = None
+
+            if os.path.isfile(self.preview_image_path):
+                self.preview_photo = tk.PhotoImage(file=self.preview_image_path)
+                self.preview_canvas.delete("all")
+                self.preview_canvas.create_image(width * 0.5, height * 0.5, image=self.preview_photo)
+                return True
+
+            return False
+        except Exception as exc:
+            if not self._pyvista_error_logged:
+                self._log(f"PyVista preview failed, using fallback renderer: {exc}")
+                self._pyvista_error_logged = True
+            return False
+        finally:
+            if plotter is not None:
+                try:
+                    plotter.close()
+                except Exception:
+                    pass
+
     def _load_stl_triangles(self, file_path, max_triangles=4000):
         try:
             with open(file_path, "rb") as f:
@@ -462,6 +555,15 @@ class ParametricGenerator:
 
     def _render_preview(self):
         self.preview_canvas.delete("all")
+
+        if self._render_preview_pyvista(
+            max(10, self.preview_canvas.winfo_width()),
+            max(10, self.preview_canvas.winfo_height()),
+        ):
+            return
+
+        self._draw_preview_message("PyVista preview failed")
+        return
 
         if not self.preview_triangles:
             self._draw_preview_message("Preview will appear here")
@@ -531,7 +633,7 @@ class ParametricGenerator:
             sy = height * 0.5 - (ry - center_py) * scale
             return sx, sy
 
-        light_dir = (-0.45, -0.35, 0.82)
+        light_dir = (-0.55, -0.35, 0.75)
         light_len = math.sqrt(
             light_dir[0] * light_dir[0] + light_dir[1] * light_dir[1] + light_dir[2] * light_dir[2]
         )
@@ -540,6 +642,7 @@ class ParametricGenerator:
             light_dir[1] / light_len,
             light_dir[2] / light_len,
         )
+        view_dir = (0.0, 0.0, 1.0)
 
         faces = []
         for tri in rotated_faces:
@@ -595,12 +698,30 @@ class ParametricGenerator:
 
             if rn_len > 1e-9:
                 rnx, rny, rnz = rnx / rn_len, rny / rn_len, rnz / rn_len
-                ndotl = abs(rnx * lx + rny * ly + rnz * lz)
+
+                # Keep normal facing the camera for stable lighting across STL winding.
+                if rnx * view_dir[0] + rny * view_dir[1] + rnz * view_dir[2] < 0.0:
+                    rnx, rny, rnz = -rnx, -rny, -rnz
+
+                ndotl = max(0.0, rnx * lx + rny * ly + rnz * lz)
+
+                rx = 2.0 * ndotl * rnx - lx
+                ry = 2.0 * ndotl * rny - ly
+                rz = 2.0 * ndotl * rnz - lz
+                r_len = math.sqrt(rx * rx + ry * ry + rz * rz)
+                if r_len > 1e-9:
+                    rx, ry, rz = rx / r_len, ry / r_len, rz / r_len
+                spec = max(0.0, rx * view_dir[0] + ry * view_dir[1] + rz * view_dir[2]) ** 22
             else:
                 ndotl = 0.0
+                spec = 0.0
 
-            intensity = 0.56 + 0.44 * ndotl
-            shade = int(max(128, min(226, 95 + intensity * 135)))
+            ambient = 0.28
+            diffuse = 0.62 * ndotl
+            specular = 0.22 * spec
+            intensity = max(0.0, min(1.0, ambient + diffuse + specular))
+
+            shade = int(max(88, min(235, 70 + intensity * 165)))
             plane_shades[plane_key] = shade
 
         z_values = [p[2] for _, tri, _ in faces for p in tri]
@@ -777,6 +898,8 @@ class ParametricGenerator:
         try:
             if os.path.exists(self.preview_path):
                 os.remove(self.preview_path)
+            if os.path.exists(self.preview_image_path):
+                os.remove(self.preview_image_path)
         except Exception:
             pass
         self.root.destroy()
