@@ -15,11 +15,10 @@ Date: January 2026
 
 import os
 import sys
+import json
 import subprocess
-import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
-from pathlib import Path
+from tkinter import ttk, filedialog, scrolledtext
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GLOBAL CONSTANTS & CONFIGURATION
@@ -60,6 +59,7 @@ EXECUTABLE_FILETYPES = [("Executable files", "*.exe"), ("All files", "*.*")]
 
 # Processing timeouts
 FREECAD_TIMEOUT = 120  # seconds
+PARAM_SCAN_TIMEOUT = 60  # seconds
 
 # Runner script filename
 RUNNER_SCRIPT_NAME = "_runner.py"
@@ -94,11 +94,9 @@ class ParametricGenerator:
         self.template_path = tk.StringVar()
         self.output_path = tk.StringVar()
         self.freecad_path = tk.StringVar()
-        self.c1_var = tk.StringVar()
-        self.c2_var = tk.StringVar()
-        self.c3_var = tk.StringVar()
-        self.c4_var = tk.StringVar()
+        self.parameter_entries = []
         self.stl_var = tk.BooleanVar(value=True)
+
     def _auto_detect_freecad(self):
         """
         Auto-detect FreeCAD installation on Windows.
@@ -163,25 +161,17 @@ class ParametricGenerator:
         self._log_message("Ready. Select template file, output folder, enter parameters, and click Generate.")
     
     def _create_parameters_section(self, parent, start_row):
-        """Create the parameters input section."""
-        params_frame = ttk.LabelFrame(parent, text="Parameters (e.g., '50 mm')", padding="5")
-        params_frame.grid(row=start_row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
-        params_frame.columnconfigure(1, weight=1)
-        
-        parameter_definitions = [
-            ("C1:", self.c1_var),
-            ("C2:", self.c2_var), 
-            ("C3:", self.c3_var),
-            ("C4:", self.c4_var)
-        ]
-        
-        for i, (label_text, variable) in enumerate(parameter_definitions):
-            ttk.Label(params_frame, text=label_text).grid(
-                row=i, column=0, sticky=tk.W, padx=5, pady=2
-            )
-            entry = ttk.Entry(params_frame, textvariable=variable, font=UI_FONT_LARGE)
-            entry.grid(row=i, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
-            
+        """Create the dynamic parameters input section."""
+        self.params_frame = ttk.LabelFrame(parent, text="Template Parameters", padding="5")
+        self.params_frame.grid(row=start_row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        self.params_frame.columnconfigure(1, weight=1)
+
+        self.params_hint = ttk.Label(
+            self.params_frame,
+            text="Select a template to auto-load labels from column A and values from column B."
+        )
+        self.params_hint.grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=5, pady=2)
+
         return start_row + 1
     
     def _create_file_selection_section(self, parent, start_row):
@@ -260,6 +250,7 @@ class ParametricGenerator:
         )
         if filename:
             self.template_path.set(filename)
+            self._load_parameters_from_template()
             
     def _browse_output(self):
         """Browse for output folder."""
@@ -311,9 +302,13 @@ class ParametricGenerator:
         if not self.freecad_path.get() or not os.path.isfile(self.freecad_path.get()):
             validation_errors.append("Please select FreeCADCmd.exe")
             
-        # Validate parameters
-        if not all([self.c1_var.get(), self.c2_var.get(), self.c3_var.get(), self.c4_var.get()]):
-            validation_errors.append("Please enter all parameters")
+        # Validate parameters loaded from template
+        if not self.parameter_entries:
+            validation_errors.append("No parameters loaded. Select a template with values in column B from B2 downward")
+        else:
+            missing = [p["label"] for p in self.parameter_entries if not p["var"].get().strip()]
+            if missing:
+                validation_errors.append("Please enter all parameter values")
             
         return validation_errors
     
@@ -333,6 +328,9 @@ class ParametricGenerator:
         self._log_message("Starting generation")
         
         try:
+            if not self.parameter_entries:
+                self._load_parameters_from_template()
+
             # Step 1: Validate inputs
             validation_errors = self._validate_inputs()
             if validation_errors:
@@ -439,15 +437,17 @@ class ParametricGenerator:
         """
         environment = os.environ.copy()
         
+        params_payload = [
+            {"row": p["row"], "value": p["var"].get()}
+            for p in self.parameter_entries
+        ]
+
         # Set FreeCAD-specific environment variables
         environment.update({
             'FREECAD_TEMPLATE': self.template_path.get(),
             'FREECAD_OUTPUT': self.output_path.get(),
             'FREECAD_BASE': self._generate_filename_base(),
-            'FREECAD_C1': self.c1_var.get(),
-            'FREECAD_C2': self.c2_var.get(),
-            'FREECAD_C3': self.c3_var.get(),
-            'FREECAD_C4': self.c4_var.get()
+            'FREECAD_PARAMS_JSON': json.dumps(params_payload)
         })
         
         return environment
@@ -490,6 +490,100 @@ class ParametricGenerator:
                 os.remove(runner_path)
         except Exception:
             pass  # Ignore cleanup errors
+
+    def _load_parameters_from_template(self):
+        """Load parameter labels/values from Spreadsheet A/B starting at row 2 until B is empty."""
+        template = self.template_path.get().strip()
+        freecad_cmd = self.freecad_path.get().strip()
+
+        if not template or not os.path.isfile(template):
+            return False
+        if not freecad_cmd or not os.path.isfile(freecad_cmd):
+            self._log_message("Please select FreeCADCmd.exe before loading parameters")
+            return False
+
+        env = os.environ.copy()
+        env['FREECAD_TEMPLATE'] = template
+
+        command = [freecad_cmd, "-c", self._create_param_scan_script_content()]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                cwd=os.path.dirname(template),
+                timeout=PARAM_SCAN_TIMEOUT,
+                env=env
+            )
+        except Exception as exc:
+            self._log_message(f"Failed to read template parameters: {exc}")
+            return False
+
+        params = self._extract_params_from_output(result.stdout)
+        if result.returncode != 0 or params is None:
+            self._log_message("Could not auto-load parameters from template")
+            return False
+
+        if not params:
+            self._rebuild_parameter_inputs([])
+            self._log_message("No parameters found. Fill column B from B2 downward in the template")
+            return False
+
+        self._rebuild_parameter_inputs(params)
+        self._log_message(f"Loaded {len(params)} parameter(s) from template")
+        return True
+
+    def _extract_params_from_output(self, output_text):
+        """Parse JSON payload emitted by the parameter scanner script."""
+        begin_marker = "PARAM_SCAN_BEGIN"
+        end_marker = "PARAM_SCAN_END"
+        begin = output_text.find(begin_marker)
+        end = output_text.find(end_marker)
+        if begin == -1 or end == -1 or end <= begin:
+            return None
+
+        payload = output_text[begin + len(begin_marker):end].strip()
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(data, list):
+            return None
+        return data
+
+    def _rebuild_parameter_inputs(self, parameters):
+        """Rebuild dynamic parameter fields in the UI."""
+        for child in self.params_frame.winfo_children():
+            child.destroy()
+
+        self.parameter_entries = []
+
+        if not parameters:
+            self.params_hint = ttk.Label(
+                self.params_frame,
+                text="No parameters detected. B2, B3, ... must contain values; A cells provide labels."
+            )
+            self.params_hint.grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=5, pady=2)
+            return
+
+        self.params_frame.columnconfigure(1, weight=1)
+        for i, item in enumerate(parameters):
+            row_number = int(item.get("row", 0))
+            label_text = str(item.get("label", "")).strip() or f"Parameter {row_number}"
+            value_text = str(item.get("value", ""))
+
+            var = tk.StringVar(value=value_text)
+            display_label = f"{label_text} (B{row_number}):"
+
+            ttk.Label(self.params_frame, text=display_label).grid(
+                row=i, column=0, sticky=tk.W, padx=5, pady=2
+            )
+            ttk.Entry(self.params_frame, textvariable=var, font=UI_FONT_LARGE).grid(
+                row=i, column=1, sticky=(tk.W, tk.E), padx=5, pady=2
+            )
+
+            self.parameter_entries.append({"row": row_number, "label": label_text, "var": var})
     
     # ───────────────────────────────────────────────────────────────────────────
     # FREECAD SCRIPT GENERATION
@@ -504,51 +598,102 @@ class ParametricGenerator:
         """
         return '''import sys
 import os
+import json
 
 try:
-    # Read environment variables
     template_file = os.environ['FREECAD_TEMPLATE']
     output_folder = os.environ['FREECAD_OUTPUT']
     filename_base = os.environ['FREECAD_BASE']
-    c1_value = os.environ['FREECAD_C1']
-    c2_value = os.environ['FREECAD_C2']
-    c3_value = os.environ['FREECAD_C3']
-    c4_value = os.environ['FREECAD_C4']
-    
-    # Import FreeCAD modules
+    params_json = os.environ['FREECAD_PARAMS_JSON']
+    params = json.loads(params_json)
+
     import FreeCAD
-    
-    # Open the template document
+
     doc = FreeCAD.openDocument(template_file)
-    
-    # Update spreadsheet parameters
+
     for obj in doc.Objects:
         if hasattr(obj, 'TypeId') and obj.TypeId == 'Spreadsheet::Sheet':
             try:
-                obj.set('C2', c1_value)  # Length parameter
-                obj.set('C3', c2_value)  # Width parameter
-                obj.set('C4', c3_value)  # Height parameter
-                obj.set('C5', c4_value)  # Scale factor parameter
+                for item in params:
+                    row = int(item['row'])
+                    value = str(item['value'])
+                    obj.set(f'B{row}', value)
             except Exception:
-                pass  # Continue if parameter setting fails
+                pass
             break
-    
-    # Recompute the document to apply changes
+
     doc.recompute()
-    
-    # Export STL file
+
     for obj in doc.Objects:
         if obj.Name == "Body":
             import Mesh
             stl_file_path = os.path.join(output_folder, f"{filename_base}.stl")
             Mesh.export([obj], stl_file_path)
             break
-    
-    # Clean up - close the document
+
     FreeCAD.closeDocument(doc.Name)
-    
+
 except Exception as e:
     print(f"Error: {e}")
+    sys.exit(1)
+'''
+
+    def _create_param_scan_script_content(self):
+        """Generate a FreeCAD script that reads labels from A and values from B starting at row 2."""
+        return '''import os
+import sys
+import json
+
+try:
+    template_file = os.environ['FREECAD_TEMPLATE']
+    import FreeCAD
+
+    doc = FreeCAD.openDocument(template_file)
+    rows = []
+
+    sheet = None
+    for obj in doc.Objects:
+        if hasattr(obj, 'TypeId') and obj.TypeId == 'Spreadsheet::Sheet':
+            sheet = obj
+            break
+
+    if sheet is not None:
+        row = 2
+        while True:
+            try:
+                b_value = sheet.get(f'B{row}')
+            except Exception:
+                b_value = ''
+
+            if b_value is None or str(b_value).strip() == '':
+                break
+
+            try:
+                a_label = sheet.get(f'A{row}')
+            except Exception:
+                a_label = ''
+
+            label = str(a_label).strip() if a_label is not None else ''
+            if not label:
+                label = f'Parameter {row}'
+
+            rows.append({
+                'row': row,
+                'label': label,
+                'value': str(b_value)
+            })
+            row += 1
+
+    print('PARAM_SCAN_BEGIN')
+    print(json.dumps(rows))
+    print('PARAM_SCAN_END')
+
+    if doc is not None:
+        FreeCAD.closeDocument(doc.Name)
+except Exception:
+    print('PARAM_SCAN_BEGIN')
+    print('[]')
+    print('PARAM_SCAN_END')
     sys.exit(1)
 '''
 
