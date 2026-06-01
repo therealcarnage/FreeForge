@@ -11,8 +11,6 @@ A minimal Windows desktop app that updates FreeCAD spreadsheet inputs and export
 import json
 import math
 import os
-import re
-import struct
 import subprocess
 import sys
 import textwrap
@@ -34,15 +32,6 @@ PARAM_SCAN_TIMEOUT = 60
 PREVIEW_TIMEOUT = 60
 PREVIEW_STL_NAME = "_preview.stl"
 PREVIEW_IMAGE_NAME = "_preview.png"
-PREVIEW_MARGIN = 18
-EDGE_LENGTH_TOLERANCE = 0.12
-EDGE_AXIS_ALIGNMENT = 0.90
-
-AXIS_COLORS = {
-    "x": "#ff4d4d",  # red
-    "y": "#39d98a",  # green
-    "z": "#4da3ff",  # blue
-}
 
 FREECAD_FILETYPES = [("FreeCAD files", "*.FCStd"), ("All files", "*.*")]
 EXECUTABLE_FILETYPES = [("Executable files", "*.exe"), ("All files", "*.*")]
@@ -76,7 +65,6 @@ class ParametricGenerator:
 
         self.preview_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), PREVIEW_STL_NAME)
         self.preview_image_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), PREVIEW_IMAGE_NAME)
-        self.preview_triangles = []
         self.preview_yaw = -0.7
         self.preview_pitch = 0.45
         self.preview_after_id = None
@@ -263,16 +251,11 @@ class ParametricGenerator:
             row_number = int(item.get("row", 0))
             label = str(item.get("label", "")).strip() or f"Parameter {row_number}"
             value = str(item.get("value", ""))
-            color = self._parameter_color(label, i)
 
             var = tk.StringVar(value=value)
             var.trace_add("write", lambda *_: self._schedule_preview())
             row_wrap = ttk.Frame(self.params_frame)
             row_wrap.grid(row=i, column=0, sticky=tk.W, padx=5, pady=2)
-
-            swatch = tk.Canvas(row_wrap, width=10, height=10, highlightthickness=0)
-            swatch.pack(side=tk.LEFT, padx=(0, 6))
-            swatch.create_rectangle(0, 0, 10, 10, fill=color, outline=color)
 
             ttk.Label(row_wrap, text=f"{label} (Row {row_number}):").pack(side=tk.LEFT)
             ttk.Entry(self.params_frame, textvariable=var).grid(
@@ -416,12 +399,6 @@ class ParametricGenerator:
             self._draw_preview_message("No preview mesh generated")
             return
 
-        triangles = self._load_stl_triangles(self.preview_path)
-        if not triangles:
-            self._draw_preview_message("Preview mesh is empty")
-            return
-
-        self.preview_triangles = triangles
         self._render_preview()
 
     def _render_preview_pyvista(self, width, height):
@@ -500,7 +477,7 @@ class ParametricGenerator:
             return False
         except Exception as exc:
             if not self._pyvista_error_logged:
-                self._log(f"PyVista preview failed, using fallback renderer: {exc}")
+                self._log(f"PyVista preview failed: {exc}")
                 self._pyvista_error_logged = True
             return False
         finally:
@@ -509,49 +486,6 @@ class ParametricGenerator:
                     plotter.close()
                 except Exception:
                     pass
-
-    def _load_stl_triangles(self, file_path, max_triangles=4000):
-        try:
-            with open(file_path, "rb") as f:
-                data = f.read()
-            if len(data) < 84:
-                return []
-
-            tri_count = struct.unpack("<I", data[80:84])[0]
-            expected = 84 + tri_count * 50
-
-            triangles = []
-            if expected == len(data):
-                offset = 84
-                for _ in range(tri_count):
-                    offset += 12  # normal
-                    v1 = struct.unpack("<fff", data[offset : offset + 12])
-                    offset += 12
-                    v2 = struct.unpack("<fff", data[offset : offset + 12])
-                    offset += 12
-                    v3 = struct.unpack("<fff", data[offset : offset + 12])
-                    offset += 12
-                    offset += 2  # attr
-                    triangles.append((v1, v2, v3))
-            else:
-                text = data.decode("utf-8", errors="ignore")
-                verts = []
-                for line in text.splitlines():
-                    line = line.strip()
-                    if line.lower().startswith("vertex "):
-                        parts = line.split()
-                        if len(parts) == 4:
-                            verts.append((float(parts[1]), float(parts[2]), float(parts[3])))
-                for i in range(0, len(verts) - 2, 3):
-                    triangles.append((verts[i], verts[i + 1], verts[i + 2]))
-
-            if len(triangles) > max_triangles:
-                step = max(1, len(triangles) // max_triangles)
-                triangles = triangles[::step]
-
-            return triangles
-        except Exception:
-            return []
 
     def _render_preview(self):
         self.preview_canvas.delete("all")
@@ -564,313 +498,6 @@ class ParametricGenerator:
 
         self._draw_preview_message("PyVista preview failed")
         return
-
-        if not self.preview_triangles:
-            self._draw_preview_message("Preview will appear here")
-            return
-
-        width = max(10, self.preview_canvas.winfo_width())
-        height = max(10, self.preview_canvas.winfo_height())
-
-        points = [p for tri in self.preview_triangles for p in tri]
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
-        zs = [p[2] for p in points]
-
-        cx = (min(xs) + max(xs)) * 0.5
-        cy = (min(ys) + max(ys)) * 0.5
-        cz = (min(zs) + max(zs)) * 0.5
-
-        cos_y = math.cos(self.preview_yaw)
-        sin_y = math.sin(self.preview_yaw)
-        cos_x = math.cos(self.preview_pitch)
-        sin_x = math.sin(self.preview_pitch)
-
-        def rotate_point(px, py, pz):
-            xz_x = px * cos_y + pz * sin_y
-            xz_z = -px * sin_y + pz * cos_y
-            yz_y = py * cos_x - xz_z * sin_x
-            yz_z = py * sin_x + xz_z * cos_x
-            return xz_x, yz_y, yz_z
-
-        # First pass: rotate everything and compute projected extents.
-        centered_faces = []
-        rotated_faces = []
-        proj_xs = []
-        proj_ys = []
-
-        for tri in self.preview_triangles:
-            ctri = []
-            rtri = []
-            for vx, vy, vz in tri:
-                x = vx - cx
-                y = vy - cy
-                z = vz - cz
-                ctri.append((x, y, z))
-                rx, ry, rz = rotate_point(x, y, z)
-                rtri.append((rx, ry, rz))
-                proj_xs.append(rx)
-                proj_ys.append(ry)
-            centered_faces.append(ctri)
-            rotated_faces.append(rtri)
-
-        min_px = min(proj_xs)
-        max_px = max(proj_xs)
-        min_py = min(proj_ys)
-        max_py = max(proj_ys)
-
-        model_w = max(max_px - min_px, 1e-6)
-        model_h = max(max_py - min_py, 1e-6)
-        avail_w = max(width - 2 * PREVIEW_MARGIN, 10)
-        avail_h = max(height - 2 * PREVIEW_MARGIN, 10)
-        scale = min(avail_w / model_w, avail_h / model_h)
-
-        center_px = (min_px + max_px) * 0.5
-        center_py = (min_py + max_py) * 0.5
-
-        def project_to_canvas(rx, ry):
-            sx = width * 0.5 + (rx - center_px) * scale
-            sy = height * 0.5 - (ry - center_py) * scale
-            return sx, sy
-
-        light_dir = (-0.55, -0.35, 0.75)
-        light_len = math.sqrt(
-            light_dir[0] * light_dir[0] + light_dir[1] * light_dir[1] + light_dir[2] * light_dir[2]
-        )
-        lx, ly, lz = (
-            light_dir[0] / light_len,
-            light_dir[1] / light_len,
-            light_dir[2] / light_len,
-        )
-        view_dir = (0.0, 0.0, 1.0)
-
-        faces = []
-        for tri in rotated_faces:
-            projected = []
-            depth_accum = 0.0
-            rot_pts = []
-            for rx, ry, rz in tri:
-                sx, sy = project_to_canvas(rx, ry)
-                projected.append((sx, sy, rz))
-                depth_accum += rz
-                rot_pts.append((rx, ry, rz))
-
-            z_avg = depth_accum / 3.0
-            faces.append((z_avg, projected, rot_pts))
-
-        # Compute one shade per geometric plane so split triangles on a flat
-        # face cannot produce seams or flicker.
-        plane_shades = {}
-        for ctri, rtri in zip(centered_faces, rotated_faces):
-            ca, cb, cc = ctri
-            cux, cuy, cuz = (cb[0] - ca[0], cb[1] - ca[1], cb[2] - ca[2])
-            cvx, cvy, cvz = (cc[0] - ca[0], cc[1] - ca[1], cc[2] - ca[2])
-            cnx = cuy * cvz - cuz * cvy
-            cny = cuz * cvx - cux * cvz
-            cnz = cux * cvy - cuy * cvx
-            cn_len = math.sqrt(cnx * cnx + cny * cny + cnz * cnz)
-            if cn_len < 1e-9:
-                continue
-
-            cnx, cny, cnz = cnx / cn_len, cny / cn_len, cnz / cn_len
-            d = -(cnx * ca[0] + cny * ca[1] + cnz * ca[2])
-
-            # Canonical orientation keeps opposite-winding triangles together
-            # on the same plane.
-            if (
-                cnx < -1e-9
-                or (abs(cnx) <= 1e-9 and cny < -1e-9)
-                or (abs(cnx) <= 1e-9 and abs(cny) <= 1e-9 and cnz < -1e-9)
-            ):
-                cnx, cny, cnz, d = -cnx, -cny, -cnz, -d
-
-            plane_key = (round(cnx, 4), round(cny, 4), round(cnz, 4), round(d, 4))
-            if plane_key in plane_shades:
-                continue
-
-            ra, rb, rc = rtri
-            rux, ruy, ruz = (rb[0] - ra[0], rb[1] - ra[1], rb[2] - ra[2])
-            rvx, rvy, rvz = (rc[0] - ra[0], rc[1] - ra[1], rc[2] - ra[2])
-            rnx = ruy * rvz - ruz * rvy
-            rny = ruz * rvx - rux * rvz
-            rnz = rux * rvy - ruy * rvx
-            rn_len = math.sqrt(rnx * rnx + rny * rny + rnz * rnz)
-
-            if rn_len > 1e-9:
-                rnx, rny, rnz = rnx / rn_len, rny / rn_len, rnz / rn_len
-
-                # Keep normal facing the camera for stable lighting across STL winding.
-                if rnx * view_dir[0] + rny * view_dir[1] + rnz * view_dir[2] < 0.0:
-                    rnx, rny, rnz = -rnx, -rny, -rnz
-
-                ndotl = max(0.0, rnx * lx + rny * ly + rnz * lz)
-
-                rx = 2.0 * ndotl * rnx - lx
-                ry = 2.0 * ndotl * rny - ly
-                rz = 2.0 * ndotl * rnz - lz
-                r_len = math.sqrt(rx * rx + ry * ry + rz * rz)
-                if r_len > 1e-9:
-                    rx, ry, rz = rx / r_len, ry / r_len, rz / r_len
-                spec = max(0.0, rx * view_dir[0] + ry * view_dir[1] + rz * view_dir[2]) ** 22
-            else:
-                ndotl = 0.0
-                spec = 0.0
-
-            ambient = 0.28
-            diffuse = 0.62 * ndotl
-            specular = 0.22 * spec
-            intensity = max(0.0, min(1.0, ambient + diffuse + specular))
-
-            shade = int(max(88, min(235, 70 + intensity * 165)))
-            plane_shades[plane_key] = shade
-
-        z_values = [p[2] for _, tri, _ in faces for p in tri]
-        depth_range = max(z_values) - min(z_values) if z_values else 1.0
-        depth_tolerance = max(1e-6, depth_range * 0.003)
-
-        def depth_at_point_on_triangle(px, py, tri):
-            (x1, y1, z1), (x2, y2, z2), (x3, y3, z3) = tri
-            denom = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
-            if abs(denom) < 1e-9:
-                return None
-
-            l1 = ((y2 - y3) * (px - x3) + (x3 - x2) * (py - y3)) / denom
-            l2 = ((y3 - y1) * (px - x3) + (x1 - x3) * (py - y3)) / denom
-            l3 = 1.0 - l1 - l2
-
-            if l1 < -1e-4 or l2 < -1e-4 or l3 < -1e-4:
-                return None
-
-            return l1 * z1 + l2 * z2 + l3 * z3
-
-        faces.sort(key=lambda item: item[0])
-
-        for _z_avg, tri, rot_pts in faces:
-            flat = [coord for p in tri for coord in (p[0], p[1])]
-
-            a, b, c = rot_pts
-            ux, uy, uz = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
-            vx, vy, vz = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
-            nx = uy * vz - uz * vy
-            ny = uz * vx - ux * vz
-            nz = ux * vy - uy * vx
-            n_len = math.sqrt(nx * nx + ny * ny + nz * nz)
-            if n_len > 1e-9:
-                nx, ny, nz = nx / n_len, ny / n_len, nz / n_len
-            else:
-                nx, ny, nz = 0.0, 0.0, 1.0
-
-            d = -(nx * a[0] + ny * a[1] + nz * a[2])
-            if (
-                nx < -1e-9
-                or (abs(nx) <= 1e-9 and ny < -1e-9)
-                or (abs(nx) <= 1e-9 and abs(ny) <= 1e-9 and nz < -1e-9)
-            ):
-                nx, ny, nz, d = -nx, -ny, -nz, -d
-
-            shade = plane_shades.get((round(nx, 4), round(ny, 4), round(nz, 4), round(d, 4)), 186)
-
-            face_color = f"#{shade:02x}{shade:02x}{shade:02x}"
-            self.preview_canvas.create_polygon(flat, fill=face_color, outline=face_color, width=1)
-
-        # Build real feature edges from triangle adjacency.
-        edge_map = {}
-        for ctri, rtri in zip(centered_faces, rotated_faces):
-            # Face normal in centered model space.
-            a0, b0, c0 = ctri
-            ux, uy, uz = (b0[0] - a0[0], b0[1] - a0[1], b0[2] - a0[2])
-            vx, vy, vz = (c0[0] - a0[0], c0[1] - a0[1], c0[2] - a0[2])
-            fnx = uy * vz - uz * vy
-            fny = uz * vx - ux * vz
-            fnz = ux * vy - uy * vx
-            fn_len = math.sqrt(fnx * fnx + fny * fny + fnz * fnz)
-            if fn_len > 1e-9:
-                face_normal = (fnx / fn_len, fny / fn_len, fnz / fn_len)
-            else:
-                face_normal = (0.0, 0.0, 0.0)
-
-            for a, b in ((0, 1), (1, 2), (2, 0)):
-                pa = ctri[a]
-                pb = ctri[b]
-                ra = rtri[a]
-                rb = rtri[b]
-
-                ka = (round(pa[0], 6), round(pa[1], 6), round(pa[2], 6))
-                kb = (round(pb[0], 6), round(pb[1], 6), round(pb[2], 6))
-                key = tuple(sorted((ka, kb)))
-                dx = pa[0] - pb[0]
-                dy = pa[1] - pb[1]
-                dz = pa[2] - pb[2]
-                edge_len = math.sqrt(dx * dx + dy * dy + dz * dz)
-                if key not in edge_map:
-                    edge_map[key] = {
-                        "len": edge_len,
-                        "vec": (dx, dy, dz),
-                        "ra": ra,
-                        "rb": rb,
-                        "count": 1,
-                        "normals": [face_normal],
-                    }
-                else:
-                    edge_map[key]["count"] += 1
-                    edge_map[key]["normals"].append(face_normal)
-
-        targets = self._parameter_edge_targets()
-        if targets and edge_map:
-            edges = list(edge_map.values())
-            axis_idx = {"x": 0, "y": 1, "z": 2}
-
-            for target in targets:
-                desired_axis = target.get("axis")
-                desired_idx = axis_idx.get(desired_axis, None)
-
-                # Stable rule: highlight all matching mesh edges for this parameter.
-                for edge in edges:
-                    # Keep only real feature edges and ignore triangulation diagonals.
-                    if edge["count"] >= 2 and len(edge["normals"]) >= 2:
-                        n1 = edge["normals"][0]
-                        n2 = edge["normals"][1]
-                        dot = n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2]
-                        # Coplanar shared edges are mesh diagonals; skip them.
-                        if abs(dot) > 0.98:
-                            continue
-
-                    s1 = project_to_canvas(edge["ra"][0], edge["ra"][1])
-                    s2 = project_to_canvas(edge["rb"][0], edge["rb"][1])
-                    screen_len = math.hypot(s2[0] - s1[0], s2[1] - s1[1])
-                    if screen_len < 8:
-                        continue
-
-                    rel_len_err = abs(edge["len"] - target["value"]) / max(target["value"], 1e-9)
-                    if rel_len_err > EDGE_LENGTH_TOLERANCE:
-                        continue
-
-                    if desired_idx is not None:
-                        vx, vy, vz = edge["vec"]
-                        axis_align = abs((vx, vy, vz)[desired_idx]) / max(edge["len"], 1e-9)
-                        if axis_align < EDGE_AXIS_ALIGNMENT:
-                            continue
-
-                    # Hide edges that are occluded by a nearer face so the model
-                    # reads as a solid and never as see-through.
-                    mx = (s1[0] + s2[0]) * 0.5
-                    my = (s1[1] + s2[1]) * 0.5
-                    edge_depth = (edge["ra"][2] + edge["rb"][2]) * 0.5
-
-                    nearest_depth = None
-                    for _zavg, face_tri, _rot in faces:
-                        z_at_mid = depth_at_point_on_triangle(mx, my, face_tri)
-                        if z_at_mid is None:
-                            continue
-                        if nearest_depth is None or z_at_mid > nearest_depth:
-                            nearest_depth = z_at_mid
-
-                    if nearest_depth is not None and (nearest_depth - edge_depth) > depth_tolerance:
-                        continue
-
-                    self.preview_canvas.create_line(
-                        s1[0], s1[1], s2[0], s2[1], fill=target["color"], width=4
-                    )
 
     def _draw_preview_message(self, message):
         self.preview_canvas.delete("all")
@@ -903,79 +530,6 @@ class ParametricGenerator:
         except Exception:
             pass
         self.root.destroy()
-
-    def _parameter_color(self, label, index):
-        name = label.strip().lower()
-        if "length" in name:
-            return AXIS_COLORS["x"]
-        if "width" in name:
-            return AXIS_COLORS["y"]
-        if "height" in name:
-            return AXIS_COLORS["z"]
-        fallback = ["#ffcc66", "#c792ea", "#80cbc4", "#f78c6c"]
-        return fallback[index % len(fallback)]
-
-    def _parse_numeric_value(self, text):
-        if text is None:
-            return None
-        s = str(text).strip().replace(",", "")
-        m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
-        if not m:
-            return None
-        try:
-            return abs(float(m.group(0)))
-        except Exception:
-            return None
-
-    def _parameter_edge_targets(self):
-        targets = []
-
-        # Prefer named dimensions first.
-        named_order = [("length", "x"), ("width", "y"), ("height", "z")]
-        used = set()
-        for keyword, axis in named_order:
-            for i, p in enumerate(self.parameter_entries):
-                if i in used:
-                    continue
-                name = p["label"].strip().lower()
-                if keyword in name:
-                    num = self._parse_numeric_value(p["var"].get())
-                    if num and num > 0:
-                        targets.append(
-                            {
-                                "axis": axis,
-                                "value": num,
-                                "color": AXIS_COLORS[axis],
-                                "index": i,
-                            }
-                        )
-                        used.add(i)
-                    break
-
-        # Fallback: first remaining numeric params.
-        if not targets:
-            fallback_axes = ["x", "y", "z"]
-            for i, p in enumerate(self.parameter_entries):
-                if i in used:
-                    continue
-                lname = p["label"].strip().lower()
-                if "scale" in lname:
-                    continue
-                num = self._parse_numeric_value(p["var"].get())
-                if num and num > 0:
-                    axis = fallback_axes[len(targets) % len(fallback_axes)]
-                    targets.append(
-                        {
-                            "axis": axis,
-                            "value": num,
-                            "color": AXIS_COLORS[axis],
-                            "index": i,
-                        }
-                    )
-                if len(targets) >= 3:
-                    break
-
-        return targets
 
     # ------------------------------------------------------------------------
     # FREECAD SCRIPT EXECUTION
